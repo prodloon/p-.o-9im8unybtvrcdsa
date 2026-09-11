@@ -43,7 +43,11 @@ fn spawn_backend() -> Option<Child> {
     // Prefer the exact node the user has; fall back to PATH lookup.
     for candidate in ["/usr/local/bin/node", "node"] {
         let mut cmd = Command::new(candidate);
-        cmd.arg("--serve").current_dir(&root).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.arg(&script)
+            .arg("--serve")
+            .current_dir(&root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         match cmd.spawn() {
             Ok(child) => {
                 println!("[shell] backend spawned ({} {})", candidate, child.id());
