@@ -163,10 +163,19 @@ class Governor {
   }
 
   heartbeat(workerId, ramBytes = null) {
+    const now = this.clock();
     const res = this.db
       .prepare('UPDATE workers SET last_heartbeat = ?, ram_bytes = COALESCE(?, ram_bytes) WHERE id = ?')
-      .run(this.clock(), ramBytes, workerId);
-    return res.changes > 0;
+      .run(now, ramBytes, workerId);
+    if (res.changes > 0) return true;
+    // Defensive upsert: a worker heartbeating without a row (e.g. constructed
+    // outside the pool) still gets one, so FKs and reapers have real data.
+    this.db
+      .prepare(
+        "INSERT INTO workers (id, kind, state, priority, ram_bytes, spawned_at, last_heartbeat) VALUES (?, 'unregistered', 'running', 5, ?, ?, ?)"
+      )
+      .run(workerId, ramBytes, now, now);
+    return true;
   }
 
   /** node:sqlite binds only primitives — serialize objects defensively. */
@@ -270,15 +279,20 @@ class Governor {
    * Atomically lease one pending task to a worker.
    * BEGIN IMMEDIATE so two workers cannot lease the same task
    * (node:sqlite has no .transaction() helper — manual is correct).
+   * @param {string|null} [kindFilter] only lease tasks of this kind (null = any)
    */
-  leaseNextTask(workerId, { leaseMs = 60_000 } = {}) {
+  leaseNextTask(workerId, { leaseMs = 60_000, kindFilter = null } = {}) {
     const now = this.clock();
     let task = null;
     this.db.exec('BEGIN IMMEDIATE');
     try {
       task = this.db
-        .prepare("SELECT id, kind, payload_json FROM task_queue WHERE status='pending' ORDER BY id LIMIT 1")
-        .get();
+        .prepare(
+          kindFilter
+            ? "SELECT id, kind, payload_json, attempts FROM task_queue WHERE status='pending' AND kind = ? ORDER BY id LIMIT 1"
+            : "SELECT id, kind, payload_json, attempts FROM task_queue WHERE status='pending' ORDER BY id LIMIT 1"
+        )
+        .get(...(kindFilter ? [kindFilter] : []));
       if (task) {
         this.db
           .prepare("UPDATE task_queue SET status='leased', leased_by=?, lease_expires=? WHERE id=?")
@@ -353,6 +367,13 @@ class Governor {
 
   isSpawnBlocked() {
     return this.spawnBlocked;
+  }
+
+  /** Record a skill-sniping event (used by the orchestrator's injector). */
+  logSkillEvent(workerId, skillName, source, outcome) {
+    this.db
+      .prepare('INSERT INTO skill_events (ts, worker_id, skill_name, source, outcome) VALUES (?, ?, ?, ?, ?)')
+      .run(this.clock(), workerId, skillName, source, outcome);
   }
 
   close() {

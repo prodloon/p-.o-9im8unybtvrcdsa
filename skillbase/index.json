@@ -1,0 +1,17 @@
+[
+  {
+    "name": "scaffold-express-api",
+    "file": "scaffold-express-api.md",
+    "triggers": ["scaffold", "express", "api", "rest", "endpoint"]
+  },
+  {
+    "name": "file-bulk-rename",
+    "file": "file-bulk-rename.md",
+    "triggers": ["rename", "bulk", "batch", "files"]
+  },
+  {
+    "name": "api-route-map",
+    "file": "api-route-map.md",
+    "triggers": ["route", "routes", "map", "inventory", "audit"]
+  }
+]

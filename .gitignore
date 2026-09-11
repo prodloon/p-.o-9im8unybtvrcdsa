@@ -13,6 +13,7 @@ node_modules/
 database/*.sqlite
 database/*.sqlite-wal
 database/*.sqlite-shm
+daisy_sandbox_cluster/
 .env
 
 # macOS

@@ -1,5 +1,5 @@
 # Daisy Chain — Hybrid Cloud-Local Multi-Agent Cluster
-**Status:** PHASE 1 COMPLETE (governor live, 42/42 selftest green). Phases 2–6 pending.
+**Status:** PHASES 1–3 COMPLETE (governor 43/43, backend 47/47, real CLI smoke-tested). Phases 4–6 remaining (Phase 4 skillbase was delivered early with Phase 3).
 **Written:** 2026-09-11 · **Author of this document:** Buffy (Principal Systems Architect plan)
 **Constraint:** 16 GB RAM, single Mac. Existing app keeps running from `~/` until cutover.
 
@@ -7,7 +7,11 @@
 - 2026-09-11: Plan approved by user. Python `daisy_*.py` files frozen (no edits Phases 1–4).
 - 2026-09-11: Supervisor models PINNED for Phase 3: primary `anthropic/claude-3.5-sonnet` (OpenRouter), fallback `meta-llama/llama-3.3-70b-instruct` (high-speed/low-cost).
 - 2026-09-11: SQLite driver = built-in `node:sqlite` (Node v26.7.0 on this Mac; no npm deps, no native builds). Note: it has no `.transaction()` helper — use manual `BEGIN IMMEDIATE`; it binds only primitives — serialize objects with `JSON.stringify` (see `Governor._serialize`).
-- 2026-09-11: Phase 1 delivered: `governor/governor.js` (policy + SQLite + reapers + injectable ram/clock seams), `governor/init-database.js`, `governor/governor.selftest.js` (7 suites, 42 checks — ALL GREEN).
+- 2026-09-11: Phase 1 delivered: `governor/governor.js` (policy + SQLite + reapers + injectable ram/clock seams), `governor/init-database.js`, `governor/governor.selftest.js` — now 43 checks, ALL GREEN.
+- 2026-09-11: Phases 2+3 delivered. `backend/worker.js` (deterministic state machine, sandboxed file ops, SNIPE gate that refuses to act before skill injection), `backend/worker-pool.js` (claim/release semantics, spawn-block aware, hibernate/restore via SQLite), `backend/supervisor-bridge.js` (OpenRouter; claude-3.5-sonnet → llama-3.3-70b chain, 429/5xx exponential backoff w/ Retry-After, key strictly from env), `backend/skill-injector.js` (catalog validation, path-jail, supervisor + local keyword fallback), `backend/index.js` (orchestrator loop; `--enqueue` / one-shot / `--serve` CLI). `backend/backend.selftest.js`: 11 suites, 47 checks, ALL GREEN; cloud fully mocked via injectable fetch.
+- 2026-09-11: Pool semantics: `acquire()` marks workers `claimed` and returns null (never throws) when pool is exhausted and spawn-blocked; orchestrator releases workers to `done`/`failed` after each task. Governor `heartbeat()` upserts an 'unregistered' row for unknown workers (bare workers may heartbeat pre-registration). Poison tasks fail permanently after 3 attempts with `attempts` carried across retries.
+- 2026-09-11: Worker sandbox root = `daisy_sandbox_cluster/` (gitignored). All worker file ops path-jailed; no shell execution anywhere in the cluster.
+- 2026-09-11: To use the real cloud: export OPENROUTER_API_KEY (never commit). Without it the cluster runs fully on local keyword sniping — verified working end-to-end via CLI.
 
 ---
 

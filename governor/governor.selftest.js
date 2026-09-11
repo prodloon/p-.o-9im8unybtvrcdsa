@@ -87,7 +87,12 @@ suite('S2: register / heartbeat / stale reaping');
     check('two workers registered', t.gov.db.prepare('SELECT COUNT(*) n FROM workers').get().n === 2);
 
     check('heartbeat updates row', t.gov.heartbeat('w-1', 15 * 1024 * 1024));
-    check('heartbeat unknown worker fails', !t.gov.heartbeat('nope'));
+    // Since Phase 2: unknown-worker heartbeat upserts an 'unregistered' row
+    // (bare workers may heartbeat before pool registration) instead of failing.
+    check('heartbeat unknown worker upserts unregistered row', t.gov.heartbeat('nope') === true);
+    const unreg = t.gov.db.prepare("SELECT kind FROM workers WHERE id='nope'").get();
+    check('upserted row marked unregistered', unreg && unreg.kind === 'unregistered');
+    t.gov.db.prepare("DELETE FROM workers WHERE id='nope'").run(); // keep later checks clean
 
     // Age w-1 past STALE_MS while keeping w-2 alive with periodic heartbeats
     for (let i = 0; i < 40; i++) {
