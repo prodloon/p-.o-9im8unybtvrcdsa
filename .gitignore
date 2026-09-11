@@ -8,5 +8,12 @@ venv/
 daisy_env/
 daisy_sandbox/
 
+# Cluster (Phase 1+)
+node_modules/
+database/*.sqlite
+database/*.sqlite-wal
+database/*.sqlite-shm
+.env
+
 # macOS
 .DS_Store
