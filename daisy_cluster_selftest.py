@@ -92,11 +92,24 @@ def suite_live_pipeline():
     # run a cycle
     r = cli()
     check("live", "cycle exits 0", r.returncode == 0, r.stderr[:100])
-    try:
-        stats = json.loads(r.stdout.strip().splitlines()[-1])
-        check("live", "task completed in cycle", stats.get("tasksDone", 0) >= 1, str(stats))
-    except (ValueError, IndexError):
-        check("live", "cycle prints stats JSON", False, r.stdout[:120])
+
+    # A resident --serve orchestrator may drain the queue before the one-shot
+    # cycle gets it — that IS the cluster working. Assert the task's FINAL
+    # state in the DB (poll briefly), regardless of who completed it.
+    status = None
+    for _ in range(10):
+        probe = subprocess.run([NODE, "-e", f"""
+            const {{DatabaseSync}} = require('node:sqlite');
+            const db = new DatabaseSync({json.dumps(db)});
+            const rows = db.prepare('SELECT status FROM task_queue ORDER BY id DESC LIMIT 1').all();
+            console.log(rows.length ? rows[0].status : 'none');
+            db.close();
+        """], capture_output=True, text=True, timeout=30)
+        status = probe.stdout.strip().splitlines()[-1] if probe.stdout.strip() else "none"
+        if status == "done":
+            break
+        time.sleep(1)
+    check("live", "task completed (by one-shot or resident orchestrator)", status == "done", f"final status={status}")
 
     # artifact actually written to the sandbox
     artifact = os.path.join(ROOT, "daisy_sandbox_cluster", "phase6_live.txt")
