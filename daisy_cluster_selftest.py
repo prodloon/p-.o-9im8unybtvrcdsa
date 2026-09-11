@@ -1,0 +1,231 @@
+#!/usr/bin/env python
+"""
+Daisy Cluster self-test — Phase 6 battery.
+
+Runs the full Node.js cluster test stack (governor + backend batteries),
+verifies the live orchestration pipeline end-to-end via the real CLI,
+checks the Tauri/React shell artifacts, and asserts the frozen legacy
+daisy_*.py files were not modified by the cluster work.
+
+Usage:  ~/daisy_env/bin/python daisy_cluster_selftest.py
+        (or any python3 — the cluster itself is Node.js; Python is the harness)
+
+Exit code 0 = all suites green. Same suite/grade style as daisy_selftest.py.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+NODE = "/usr/local/bin/node"
+
+FROZEN_FILES = ["daisy_chain.py", "daisy_ui.py", "daisy_docs.py",
+                "daisy_research_daemon.py", "daisy_selftest.py"]
+
+# Baseline sizes from the initial commit (frozen files must stay untouched;
+# sizes are a cheap tripwire — content is verified by git status below).
+FROZEN_SIZES = {
+    "daisy_chain.py": 81730,
+    "daisy_ui.py": 70986,
+    "daisy_docs.py": 8298,
+    "daisy_research_daemon.py": 15393,
+    "daisy_selftest.py": 18447,
+}
+
+RESULTS = []
+
+
+def check(suite, name, ok, detail=""):
+    RESULTS.append((suite, name, bool(ok), detail))
+    print(f"  {'PASS' if ok else 'FAIL'}  [{suite}] {name}" + (f" — {detail}" if detail else ""))
+
+
+def run_node(script, timeout=180):
+    proc = subprocess.run([NODE, script], cwd=ROOT, capture_output=True,
+                          text=True, timeout=timeout)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def http_json(url, timeout=5):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.load(r)
+
+
+# ---------------------------------------------------------------------------
+def suite_governor_battery():
+    print("== SUITE 1: GOVERNOR BATTERY (node) ==")
+    code, out, _err = run_node("governor/governor.selftest.js")
+    check("governor", "battery exits 0", code == 0)
+    check("governor", "43/43 checks pass", "43 passed, 0 failed" in out)
+
+
+def suite_backend_battery():
+    print("== SUITE 2: BACKEND BATTERY (node) ==")
+    code, out, _err = run_node("backend/backend.selftest.js")
+    check("backend", "battery exits 0", code == 0)
+    check("backend", "47/47 checks pass", "47 passed, 0 failed" in out)
+    check("backend", "covers SNIPE gate",
+          any("SNIPE" in line for line in out.splitlines()))
+    check("backend", "covers cloud fallback chain",
+          "falls back to llama-3.3-70b" in out)
+
+
+def suite_live_pipeline():
+    """End-to-end through the REAL CLI against the REAL database file."""
+    print("== SUITE 3: LIVE PIPELINE (real CLI, real sqlite) ==")
+    db = os.path.join(ROOT, "database", "agent-states.sqlite")
+
+    def cli(*args):
+        return subprocess.run([NODE, "backend/index.js", *args],
+                              cwd=ROOT, capture_output=True, text=True, timeout=60)
+
+    # enqueue a deterministic task
+    r = cli("--enqueue", json.dumps({
+        "kind": "file-io",
+        "payload": {"action": "write_file",
+                    "params": {"path": "phase6_live.txt", "content": "live"}}}))
+    check("live", "enqueue succeeds", r.returncode == 0, r.stderr[:100])
+
+    # run a cycle
+    r = cli()
+    check("live", "cycle exits 0", r.returncode == 0, r.stderr[:100])
+    try:
+        stats = json.loads(r.stdout.strip().splitlines()[-1])
+        check("live", "task completed in cycle", stats.get("tasksDone", 0) >= 1, str(stats))
+    except (ValueError, IndexError):
+        check("live", "cycle prints stats JSON", False, r.stdout[:120])
+
+    # artifact actually written to the sandbox
+    artifact = os.path.join(ROOT, "daisy_sandbox_cluster", "phase6_live.txt")
+    check("live", "sandbox artifact written",
+          os.path.exists(artifact) and open(artifact).read() == "live")
+
+    # sqlite integrity + WAL + real data
+    check("live", "sqlite database exists", os.path.exists(db))
+    integ = subprocess.run([NODE, "-e", f"""
+        const {{DatabaseSync}} = require('node:sqlite');
+        const db = new DatabaseSync({json.dumps(db)});
+        console.log(JSON.stringify({{
+          integrity: db.prepare('PRAGMA integrity_check').get(),
+          wal: db.prepare('PRAGMA journal_mode').get(),
+          workers: db.prepare('SELECT COUNT(*) n FROM workers').get().n,
+          tasks: db.prepare('SELECT COUNT(*) n FROM task_queue').get().n,
+          skills: db.prepare('SELECT COUNT(*) n FROM skill_events').get().n,
+        }}));
+        db.close();
+    """], capture_output=True, text=True, timeout=30)
+    try:
+        info = json.loads(integ.stdout.strip().splitlines()[-1])
+        check("live", "integrity_check ok", info["integrity"]["integrity_check"] == "ok")
+        check("live", "WAL mode active", info["wal"]["journal_mode"] == "wal")
+        check("live", "workers tracked", info["workers"] >= 1)
+        check("live", "task history recorded", info["tasks"] >= 1)
+    except (ValueError, KeyError):
+        check("live", "sqlite introspection", False, integ.stdout[:120] + integ.stderr[:120])
+
+
+def suite_telemetry():
+    """telemetry.json contract + loopback HTTP server."""
+    print("== SUITE 4: TELEMETRY (file + HTTP transport) ==")
+    tele_path = os.path.join(ROOT, "database", "telemetry.json")
+    # produce fresh telemetry via the CLI cycle we just ran
+    check("telemetry", "telemetry.json exists", os.path.exists(tele_path))
+    if os.path.exists(tele_path):
+        try:
+            tele = json.load(open(tele_path))
+            for key in ("ts", "cycle", "ramPct", "spawnBlocked", "pool", "queue"):
+                check("telemetry", f"key '{key}' present", key in tele)
+            check("telemetry", "ramPct sane", isinstance(tele.get("ramPct"), (int, float))
+                  and 0 <= tele["ramPct"] <= 100)
+            check("telemetry", "pool snapshot shape",
+                  {"size", "targetSize", "spawnBlocked", "byPhase"} <= set(tele.get("pool", {})))
+        except ValueError:
+            check("telemetry", "telemetry.json parses", False)
+    else:
+        for key in ("ts", "cycle", "ramPct", "spawnBlocked", "pool", "queue"):
+            check("telemetry", f"key '{key}' present", False, "file missing")
+
+    # HTTP fallback transport on a private port
+    srv = subprocess.Popen([NODE, "backend/telemetry-server.js", "--port", "6399"],
+                           cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(0.8)
+        data = http_json("http://127.0.0.1:6399/api/telemetry")
+        check("telemetry", "HTTP transport serves JSON", isinstance(data, dict))
+    except Exception as exc:  # noqa: BLE001
+        check("telemetry", "HTTP transport serves JSON", False, str(exc))
+    finally:
+        srv.terminate()
+
+
+def suite_shell_artifacts():
+    """Tauri/React artifacts exist and the Rust crate compiles (cargo check)."""
+    print("== SUITE 5: SHELL ARTIFACTS (tauri + react) ==")
+    for rel in ("src-tauri/src/main.rs", "src-tauri/Cargo.toml",
+                "src-tauri/tauri.conf.json", "src-tauri/icons/icon.png",
+                "ui/src/App.jsx", "ui/src/telemetry.js",
+                "ui/dist/index.html"):
+        check("shell", f"{rel} exists", os.path.exists(os.path.join(ROOT, rel)))
+    check("shell", "ui production build present",
+          os.path.exists(os.path.join(ROOT, "ui", "dist", "assets")))
+
+    cargo = subprocess.run(["cargo", "check"], cwd=os.path.join(ROOT, "src-tauri"),
+                           capture_output=True, text=True, timeout=600)
+    check("shell", "cargo check passes", cargo.returncode == 0,
+          cargo.stderr.strip().splitlines()[-1] if cargo.returncode else "")
+
+
+def suite_frozen_files():
+    """The legacy daisy_*.py files must be untouched by all cluster work."""
+    print("== SUITE 6: FROZEN LEGACY FILES ==")
+    for name in FROZEN_FILES:
+        path = os.path.join(ROOT, name)
+        ok = os.path.exists(path) and os.path.getsize(path) == FROZEN_SIZES.get(name)
+        check("frozen", f"{name} byte-size unchanged", ok)
+    git_status = subprocess.run(["git", "status", "--porcelain", "--", *FROZEN_FILES],
+                                cwd=ROOT, capture_output=True, text=True)
+    check("frozen", "git reports no modifications", git_status.stdout.strip() == "",
+          git_status.stdout.strip()[:100])
+
+
+# ---------------------------------------------------------------------------
+def main():
+    print("🌼 Daisy Cluster self-test battery (Phase 6)")
+    print("=" * 60)
+    suite_governor_battery()
+    suite_backend_battery()
+    suite_live_pipeline()
+    suite_telemetry()
+    suite_shell_artifacts()
+    suite_frozen_files()
+
+    print("\n" + "=" * 60)
+    suites = {}
+    for s, n, ok, _d in RESULTS:
+        suites.setdefault(s, [0, 0])
+        suites[s][0] += 1
+        suites[s][1] += (1 if ok else 0)
+    fails = []
+    print(f"{'SUITE':<12}{'PASS':>6}{'TOTAL':>7}  GRADE")
+    for s, (total, passed) in suites.items():
+        pct = passed / total if total else 0
+        grade = ("A" if pct == 1 else "B" if pct >= .9 else "C" if pct >= .75
+                 else "D" if pct >= .5 else "F")
+        print(f"{s:<12}{passed:>6}{total:>7}  {grade}")
+        fails += [(s, n, d) for su, n, ok, d in RESULTS if su == s and not ok]
+    passed_sum = sum(t for _, t in suites.values())
+    total_sum = sum(p for p, _ in suites.values())
+    print(f"\nTOTAL: {passed_sum}/{total_sum} checks passed")
+    if fails:
+        print("\nFAILURES:")
+        for s, n, d in fails:
+            print(f"  [{s}] {n}" + (f" — {d}" if d else ""))
+        sys.exit(1)
+    print("ALL GREEN — cluster verified and launch-ready.")
+
+
+if __name__ == "__main__":
+    main()

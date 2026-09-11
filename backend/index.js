@@ -35,7 +35,9 @@ const ORCH_POLICY = {
   LEASE_MS: 60000,         // per-task lease
   MAX_TASK_ATTEMPTS: 3,    // poison-task guard
   SKILLS_CATALOG_CACHE_MS: 5000,
+  TELEMETRY_WRITE_MS: 1000, // telemetry.json refresh for the UI
 };
+const TELEMETRY_FILE = path.join(__dirname, '..', 'database', 'telemetry.json');
 
 class Orchestrator {
   constructor(opts = {}) {
@@ -193,12 +195,17 @@ class Orchestrator {
   /** Long-running mode. */
   async serve() {
     if (this.verbose) console.log(`[orch] serving — tick ${this.tickMs}ms, target fleet ${this.pool.targetSize}`);
+    let lastTelemetry = 0;
     // eslint-disable-next-line no-constant-condition
     while (true) {
       try {
         await this.runCycle();
       } catch (err) {
         console.error(`[orch] cycle error: ${String(err.message)}`);
+      }
+      if (Date.now() - lastTelemetry >= ORCH_POLICY.TELEMETRY_WRITE_MS) {
+        this.writeTelemetryFile();
+        lastTelemetry = Date.now();
       }
       await this.sleep(this.tickMs);
     }
@@ -207,6 +214,7 @@ class Orchestrator {
   telemetry() {
     const r = this.governor.ramReader();
     return {
+      ts: Date.now(),
       cycle: this._cycle,
       pool: this.pool.snapshot(),
       ramPct: Math.round((r.usedBytes / r.totalBytes) * 1000) / 10,
@@ -219,6 +227,19 @@ class Orchestrator {
       },
       workersHibernating: this.governor.db.prepare("SELECT COUNT(*) n FROM workers WHERE state='hibernating'").get().n,
     };
+  }
+
+  /** Atomically persist telemetry for the Tauri shell / UI (tmp+rename). */
+  writeTelemetryFile() {
+    try {
+      const dir = path.dirname(TELEMETRY_FILE);
+      fs.mkdirSync(dir, { recursive: true });
+      const tmp = `${TELEMETRY_FILE}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(this.telemetry()));
+      fs.renameSync(tmp, TELEMETRY_FILE); // atomic swap (the audit's #1 item)
+    } catch (err) {
+      if (this.verbose) console.log(`[orch] telemetry write failed: ${err.message}`);
+    }
   }
 
   close() {
@@ -246,6 +267,7 @@ if (require.main === module) {
     orch
       .runCycle()
       .then((stats) => {
+        orch.writeTelemetryFile(); // one-shot cycles leave telemetry for the UI too
         console.log(JSON.stringify(stats));
         orch.close();
       })

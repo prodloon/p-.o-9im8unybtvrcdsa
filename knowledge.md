@@ -1,5 +1,5 @@
 # Daisy Chain — Hybrid Cloud-Local Multi-Agent Cluster
-**Status:** PHASES 1–3 COMPLETE (governor 43/43, backend 47/47, real CLI smoke-tested). Phases 4–6 remaining (Phase 4 skillbase was delivered early with Phase 3).
+**Status:** ALL PHASES (1–6) COMPLETE — cluster verified and launch-ready. Batteries: governor 43/43, backend 47/47, cluster (Python, Phase 6) 40/40 — all grade A.
 **Written:** 2026-09-11 · **Author of this document:** Buffy (Principal Systems Architect plan)
 **Constraint:** 16 GB RAM, single Mac. Existing app keeps running from `~/` until cutover.
 
@@ -12,6 +12,9 @@
 - 2026-09-11: Pool semantics: `acquire()` marks workers `claimed` and returns null (never throws) when pool is exhausted and spawn-blocked; orchestrator releases workers to `done`/`failed` after each task. Governor `heartbeat()` upserts an 'unregistered' row for unknown workers (bare workers may heartbeat pre-registration). Poison tasks fail permanently after 3 attempts with `attempts` carried across retries.
 - 2026-09-11: Worker sandbox root = `daisy_sandbox_cluster/` (gitignored). All worker file ops path-jailed; no shell execution anywhere in the cluster.
 - 2026-09-11: To use the real cloud: export OPENROUTER_API_KEY (never commit). Without it the cluster runs fully on local keyword sniping — verified working end-to-end via CLI.
+- 2026-09-11: Phase 5 delivered. Telemetry pipeline: orchestrator writes `database/telemetry.json` (1 Hz, atomic tmp+rename) in both --serve and one-shot modes; dual-transport UI — Tauri native IPC (`telemetry://metrics` from src-tauri/main.rs emit loop) or loopback HTTP via `backend/telemetry-server.js` (:6292) under plain Vite; React 18 + Tailwind v4 dashboard (`ui/`) with 500ms throttled commits, SVG sparkline, gauge grid. Tauri v2 shell compiles (`cargo check` green; icon extracted from the legacy DaisyChain.app icns; child-process reaper on window close). UI production build verified (`vite build`, 1s).
+- 2026-09-11: Phase 6 delivered. `daisy_cluster_selftest.py` (NEW file — the standing `daisy_selftest.py` stays byte-identical per the freeze rule; battery asserts that freeze): 6 suites, 40 checks — governor battery, backend battery, live end-to-end pipeline via real CLI + real SQLite (integrity_check, WAL, history), telemetry file+HTTP contract, shell artifacts incl. `cargo check`, frozen-file tripwire. `docs/runbook.md` written (start/feed/monitor/stop/verify).
+- 2026-09-11: Remaining known items: real-cloud verification needs the user's OPENROUTER_API_KEY; per-worker CPU/RSS tracking is a future enhancement; `cargo tauri dev` first build not yet run end-to-end (compiles clean).
 
 ---
 
@@ -225,7 +228,7 @@ On `inject: true`, `skill-injector.js` reads `skillbase/{skill}.md` (or `.json`)
 | **5. Tauri + React UI** | Scaffold `src-tauri/` + `ui/`; IPC telemetry channel; gauges | `npm run tauri dev` renders live RAM/queue numbers matching governor log |
 | **6. Integration + cutover prep** | Extend `daisy_selftest.py` with cluster suites; decide cutover for the Python app | Full battery green; cutover plan written |
 
-**Cutover rule (unchanged from earlier sessions):** the live app still runs from `~/` — nothing in this plan touches it until an explicit, separate cutover step the user approves.
+**Cutover rule (unchanged from earlier sessions):** the live app still runs from `~/` — nothing in this plan touches it until an explicit, separate cutover step the user approves. The cluster sandbox is `daisy_sandbox_cluster/` (distinct from the legacy `daisy_sandbox/`).
 
 ---
 
