@@ -1,0 +1,26 @@
+[
+  {
+    "feature": "Tool / function calling",
+    "seen_in": [
+      "Open WebUI",
+      "AnythingLLM",
+      "Jan"
+    ],
+    "action": "research how AnythingLLM, Jan, Open WebUI implement 'Tool / function calling' and evaluate it for the daisy chain"
+  },
+  {
+    "feature": "RAG / document chat",
+    "seen_in": [
+      "AnythingLLM",
+      "Jan"
+    ],
+    "action": "research how AnythingLLM, Jan implement 'RAG / document chat' and evaluate it for the daisy chain"
+  },
+  {
+    "feature": "Image / vision input",
+    "seen_in": [
+      "AnythingLLM"
+    ],
+    "action": "research how AnythingLLM implement 'Image / vision input' and evaluate it for the daisy chain"
+  }
+]

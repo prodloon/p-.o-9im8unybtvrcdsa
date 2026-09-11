@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Heavy local artifacts (never track these)
+daisy_env/
+daisy_sandbox/
+
+# macOS
+.DS_Store

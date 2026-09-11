@@ -1,0 +1,104 @@
+{
+  "generated": "2026-09-11 18:26 UTC",
+  "competitors_tracked": 4,
+  "new_releases_this_run": [],
+  "findings": [
+    {
+      "repo": "open-webui/open-webui",
+      "name": "Open WebUI",
+      "blurb": "self-hosted chat UI with RAG, tools, MCP support, multi-user",
+      "status": "unchanged",
+      "latest": "0.11.3",
+      "date": "2026-08-31",
+      "url": "https://github.com/open-webui/open-webui/releases/tag/v0.11.3",
+      "features_signalled": [
+        "Tool / function calling",
+        "Export / sharing"
+      ]
+    },
+    {
+      "repo": "Mintplex-Labs/anything-llm",
+      "name": "AnythingLLM",
+      "blurb": "desktop RAG + no-code agent builder + workspaces",
+      "status": "unchanged",
+      "latest": "1.16.1",
+      "date": "2026-08-27",
+      "url": "https://github.com/Mintplex-Labs/anything-llm/releases/tag/v1.16.1",
+      "features_signalled": [
+        "RAG / document chat",
+        "Tool / function calling",
+        "Persistent multi-session memory",
+        "Agent workflows / pipelines",
+        "Image / vision input",
+        "Export / sharing"
+      ]
+    },
+    {
+      "repo": "janhq/jan",
+      "name": "Jan",
+      "blurb": "privacy-first local LLM desktop app",
+      "status": "unchanged",
+      "latest": "0.8.4",
+      "date": "2026-07-23",
+      "url": "https://github.com/janhq/jan/releases/tag/v0.8.4",
+      "features_signalled": [
+        "RAG / document chat",
+        "Tool / function calling",
+        "Agent workflows / pipelines",
+        "Export / sharing"
+      ]
+    },
+    {
+      "repo": "ollama/ollama",
+      "name": "Ollama",
+      "blurb": "the runtime underneath \u2014 new models + engine features land here first",
+      "status": "unchanged",
+      "latest": "0.34.0",
+      "date": "2026-09-05",
+      "url": "https://github.com/ollama/ollama/releases/tag/v0.34.0",
+      "features_signalled": [
+        "Agent workflows / pipelines"
+      ]
+    }
+  ],
+  "self_updates": [
+    {
+      "component": "ollama",
+      "installed": "0.33.3",
+      "latest": "0.34.0",
+      "action": "review release notes, then update"
+    },
+    {
+      "component": "pywebview",
+      "installed": "4.0.2 (pinned)",
+      "latest": "6.2.1",
+      "note": "pinned because newest needs a compiler your machine lacks \u2014 only move with care"
+    }
+  ],
+  "suggestions": [
+    {
+      "feature": "Tool / function calling",
+      "seen_in": [
+        "Open WebUI",
+        "AnythingLLM",
+        "Jan"
+      ],
+      "action": "research how AnythingLLM, Jan, Open WebUI implement 'Tool / function calling' and evaluate it for the daisy chain"
+    },
+    {
+      "feature": "RAG / document chat",
+      "seen_in": [
+        "AnythingLLM",
+        "Jan"
+      ],
+      "action": "research how AnythingLLM, Jan implement 'RAG / document chat' and evaluate it for the daisy chain"
+    },
+    {
+      "feature": "Image / vision input",
+      "seen_in": [
+        "AnythingLLM"
+      ],
+      "action": "research how AnythingLLM implement 'Image / vision input' and evaluate it for the daisy chain"
+    }
+  ]
+}
