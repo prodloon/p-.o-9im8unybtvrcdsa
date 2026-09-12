@@ -217,12 +217,24 @@ fn main() {
                         };
                         if next != feed_state {
                             if next == 2 {
-                                // Missing file at BOOT is normal in app mode (the
-                                // backend writes its first snapshot seconds after
-                                // spawn) — only alert from a seen-healthy state, or
-                                // if the file vanishes after existing.
-                                if feed_state == 1 || age.is_some() {
-                                    stale_since = Some(std::time::Instant::now());
+                                // APP-MODE BOOT RULE: the app starts after
+                                // arbitrary gaps, so a stale or missing file at
+                                // boot usually means "the app was closed" — not
+                                // an outage. Only degradation observed LIVE (a
+                                // transition FROM a seen-healthy state) may
+                                // alert; boot-time unknown→stale stays silent.
+                                if feed_state == 1 {
+                                    // Backdate the freeze start by the observed
+                                    // age: the freeze actually began ~age ago,
+                                    // so the recovery ping reports an honest
+                                    // outage length instead of alert→now.
+                                    stale_since = Some(
+                                        std::time::Instant::now()
+                                            .checked_sub(std::time::Duration::from_secs(
+                                                age.flatten().unwrap_or(stale_secs),
+                                            ))
+                                            .unwrap_or_else(std::time::Instant::now),
+                                    );
                                     let why = match age {
                                         None => "telemetry file missing".to_string(),
                                         _ => format!(
