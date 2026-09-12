@@ -126,10 +126,13 @@ Live-routing cheat sheet (all three verified in production):
 | `→ supervisor` + `no skill found` | T3 consulted and honestly declined (no skill fits) | tokens |
 | `fallback=1` | everything above declined; keyword snipe caught it | $0 |
 
-Tier-2/3 behavior is tunable via env: `DAISY_TIER2_MODEL` (set it to a bogus
-name to force T3 — useful for tests), `DAISY_OLLAMA_URL`,
-`DAISY_OLLAMA_TIMEOUT_MS` (default 120 s), `DAISY_TIER3_MODEL`. The full
-contract lives in `knowledge.md` §5.5 — the COST LAW.
+Tier-2/3 mappings are **PERMANENT** (knowledge.md §5.5): T2 =
+`qwen2.5:7b` @ `http://localhost:11434`, T3 =
+`~anthropic/claude-sonnet-latest` exclusively (no cloud fallback). Only
+`DAISY_OLLAMA_TIMEOUT_MS` (default 120 s) and `DAISY_WARM_TIER2=1`
+(pre-load Ollama weights at boot) are tunable. The full
+contract lives in `knowledge.md` §5.5 — the COST LAW. Boot-order checks
+(db/WAL → Ollama → key → orchestrator) are automated in `scripts/cluster.sh`.
 - **Quick introspection:**
   ```bash
   node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('database/agent-states.sqlite');console.table(db.prepare('SELECT event,COUNT(*) n FROM governor_log GROUP BY event').all())"

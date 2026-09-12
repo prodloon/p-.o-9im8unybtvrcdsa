@@ -147,19 +147,22 @@ class WorkerPool {
    * Acquire a worker for a task of `kind`: reuse a released one, else spawn
    * (subject to governor block), else steal any released worker. Handed-out
    * workers are marked 'claimed' so two acquires never get the same worker.
+   * EVERY handout runs beginTask() — skill grants are single-task scope, so
+   * a reused worker never carries the previous task's injectedSkill (that
+   * leak silently bypassed the SNIPE gate and the whole cascade).
    * Returns null when the pool is exhausted AND spawn is blocked.
    */
   acquire(kind) {
     const released = (w) => w.state.phase === 'idle' || w.state.phase === 'done' || w.state.phase === 'failed';
     for (const w of this.workers.values()) {
       if (w.kind === kind && released(w)) {
-        w.state.phase = 'claimed';
+        w.beginTask();
         return w;
       }
     }
     if (this.workers.size < Math.min(this.targetSize, this.maxSize) && !this.governor.isSpawnBlocked()) {
       const w = this.spawn(kind);
-      w.state.phase = 'claimed';
+      w.beginTask(); // spawn() seeds 'idle'; normalize to claimed
       return w;
     }
     let steal = null;
@@ -167,7 +170,7 @@ class WorkerPool {
       if (released(w) && (!steal || w.state.attempts < steal.state.attempts)) steal = w;
     }
     if (!steal) return null;
-    steal.state.phase = 'claimed';
+    steal.beginTask();
     return steal;
   }
 

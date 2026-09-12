@@ -208,23 +208,36 @@ async function main() {
   }
 
   // ============================================================================
-  suite('S6: bridge — model fallback after primary exhausts retries');
+  suite('S6: bridge — permanent mappings enforced; exclusive T3 retries then clean failure');
   {
+    // Mapping permanence: overrides are rejected, not silently honored.
+    let threw3 = null;
+    try { new SupervisorBridge({ apiKey: 'k', tier3Model: 'anthropic/claude-3.5-sonnet' }); } catch (e) { threw3 = e.message; }
+    check('tier3Model override rejected (permanent pin)', threw3 !== null && /permanently pinned/.test(threw3), String(threw3));
+    let threw2 = null;
+    try { new SupervisorBridge({ apiKey: 'k', tier2: { model: 'llama3:8b', url: 'http://localhost:11434/api/chat', timeoutMs: 1000, maxTokens: 100 } }); } catch (e) { threw2 = e.message; }
+    check('tier2 model override rejected (permanent pin)', threw2 !== null && /permanently pinned/.test(threw2), String(threw2));
+    let threwHost = null;
+    try { new SupervisorBridge({ apiKey: 'k', tier2: { model: 'qwen2.5:7b', url: 'http://10.0.0.5:11434/api/chat', timeoutMs: 1000, maxTokens: 100 } }); } catch (e) { threwHost = e.message; }
+    check('tier2 host override rejected (localhost:11434 pinned)', threwHost !== null, String(threwHost));
+    const pinned = new SupervisorBridge({ apiKey: 'k', tier2: null });
+    check('chain is exactly [TIER3] — no cloud fallback model', pinned.modelChain.length === 1 && pinned.modelChain[0] === POLICY.TIER3_MODEL);
+    check('tier2 mapping is the pinned ollama constant', pinned.tier2 === null || (pinned.tier2.model === 'qwen2.5:7b' && pinned.tier2.url === 'http://localhost:11434/api/chat'));
+
+    // Exclusive T3: 429s exhaust → clean failure (no llama fallback to save it).
     const calls = [];
     const bridge = new SupervisorBridge({
       apiKey: 'test-key',
+      tier2: null,
       fetchImpl: async (url, opts) => {
         calls.push(JSON.parse(opts.body).model);
-        if (JSON.parse(opts.body).model === POLICY.TIER3_MODEL) {
-          return { ok: false, status: 429, headers: { get: () => '0' }, text: async () => 'rl' };
-        }
-        return openRouterResponse('{"verdict":"delegate","skill":"api-route-map","confidence":0.8,"inject":true}');
+        return { ok: false, status: 429, headers: { get: () => '0' }, text: async () => 'rl' };
       },
       sleep: async () => {},
     });
     const res = await bridge.getVerdict(bridge.buildRequestPayload({ workerId: 'w', taskKind: 'k', taskSummary: 'audit routes', skillsCatalog: ['api-route-map'] }));
-    check('falls back to llama-3.3-70b after primary retries exhaust', res.ok && res.model === POLICY.FALLBACK_MODEL && res.verdict.skill === 'api-route-map');
-    check('chain order respected (3 primary attempts then fallback)', calls.length === 4 && calls.filter((m) => m === POLICY.TIER3_MODEL).length === 3 && calls[3] === POLICY.FALLBACK_MODEL, JSON.stringify(calls));
+    check('exclusive T3 fails clean after retries (no fallback model)', res.ok === false && /all models failed/.test(res.error));
+    check('chain order respected (exactly 3 attempts, all TIER3)', calls.length === 3 && calls.every((m) => m === POLICY.TIER3_MODEL), JSON.stringify(calls));
   }
 
   // ============================================================================
@@ -441,6 +454,45 @@ async function main() {
       } finally {
         env.cleanup();
       }
+    }
+  }
+
+  // ============================================================================
+  suite('S14: SNIPE-gate integrity — no stale-skill carryover across tasks');
+  {
+    const env = makeEnv();
+    try {
+      const bridge = new SupervisorBridge({ apiKey: null }); // keyless: escalate → decline
+      const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
+
+      // Task A: matched scaffold → tier-1 injects into w-0001-scaffold.
+      env.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'scaffold a new express api now' });
+      await orch.runCycle();
+      const wA = orch.pool.get('w-0001-scaffold');
+      check('task A got its skill injected', wA.state.injectedSkill === 'scaffold-express-api', JSON.stringify(wA.state.injectedSkill));
+      wA.state.phase = 'done'; // release exactly as the orchestrator does
+
+      // Task B: reuse the SAME worker; summary matches NOTHING → every tier declines.
+      env.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'architect a sharding and replication strategy for the orders store' });
+      const stats = await orch.runCycle();
+      check('reused worker does NOT inherit task A skill (gate consulted cascade)', stats.tasksDone === 0, JSON.stringify(stats));
+      const injBefore = wA.state.injectedSkill;
+      check('stale injectedSkill was cleared on acquire', injBefore === null, JSON.stringify(injBefore));
+      check('skill grant is per-task scope (state reset)', wA.state.skillSource === null && wA.state.skillContent === null);
+      const evts = env.governor.db.prepare("SELECT COUNT(*) n FROM skill_events WHERE worker_id='w-0001-scaffold' AND skill_name='file-bulk-rename'").get().n;
+      check('no wrong-skill injection logged for task B', evts === 0);
+
+      // Unit-level: beginTask() resets; acquire() always calls it (incl. steal path).
+      const w2 = orch.pool.spawn('file-io');
+      w2.state.injectedSkill = 'file-bulk-rename';
+      w2.beginTask();
+      check('beginTask() clears skill state', w2.state.injectedSkill === null && w2.state.skillSource === null);
+      w2.state.phase = 'done';
+      const w3 = orch.pool.acquire('file-io');
+      check('acquire() resets handed-out workers (reuse path)', w3 === w2 && w3.state.injectedSkill === null);
+      orch.close();
+    } finally {
+      env.cleanup();
     }
   }
 

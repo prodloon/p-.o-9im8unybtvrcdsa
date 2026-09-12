@@ -1,32 +1,39 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * Daisy Chain — Cloud Supervisor Bridge (Phase 3)
- * ================================================
- * Talks to OpenRouter. Primary model: anthropic/claude-3.5-sonnet;
- * fallback: meta-llama/llama-3.3-70b-instruct (per knowledge.md session log).
+ * Daisy Chain — Cloud Supervisor Bridge (Phase 3, permanent mappings)
+ * ===================================================================
+ * 3-Tier cascade (knowledge.md §5.5 COST LAW — permanent model mappings):
+ *   Tier 1: skillbase/ regex + markdown + JSON trigger templates — $0 (routeTask)
+ *   Tier 2: local Ollama qwen2.5:7b at http://localhost:11434 — $0 (triage)
+ *   Tier 3: OpenRouter ~anthropic/claude-sonnet-latest — frontier brain, exclusive
+ *
+ * The three model mappings are PINNED here and are NOT env-overridable:
+ * this exists so no future session can silently re-pin a dead slug (the
+ * original claude-3.5-sonnet pin rotted while the fallback masked it).
+ * Only OLLAMA_TIMEOUT_MS remains tunable (performance, not mapping).
  *
  * Contract (knowledge.md §5):
  *   request  = { worker_id, task_kind, task_summary, context_digest, skills_catalog }
  *   verdict  = { verdict: 'delegate'|'reject', skill?, confidence?, inject? }
  *
  * Reliability: HTTP 429 / 5xx / network errors → exponential backoff with
- * jitter, honoring Retry-After. Model fallback after retries exhaust.
- * API key strictly from env (OPENROUTER_API_KEY) — never logged, never
- * hardcoded. fetch is injectable for deterministic tests.
+ * jitter, honoring Retry-After, on the single Tier-3 model. API key strictly
+ * from env (OPENROUTER_API_KEY) — never logged, never hardcoded. fetch is
+ * injectable for deterministic tests.
  */
 
 const POLICY = {
-  // --- 3-Tier COST LAW (knowledge.md §9) ----------------------------------
+  // --- 3-Tier COST LAW — PERMANENT MAPPINGS (knowledge.md §5.5) ------------
   // Tier 1: local skillbase templates — $0 (implemented in routeTask)
-  // Tier 2: local Ollama qwen2.5:7b triage — free, offline, ~15s cold
-  // Tier 3: frontier brain via OpenRouter (tilde alias → current sonnet)
-  TIER2_OLLAMA_MODEL: process.env.DAISY_TIER2_MODEL || 'qwen2.5:7b',
-  OLLAMA_URL: process.env.DAISY_OLLAMA_URL || 'http://127.0.0.1:11434/api/chat',
+  TIER1_ENGINE: 'skillbase-templates', // regex/markdown/JSON rules in skillbase/
+  // Tier 2: local Ollama triage — free, offline
+  TIER2_OLLAMA_MODEL: 'qwen2.5:7b', // PINNED — no env override
+  OLLAMA_URL: 'http://localhost:11434/api/chat', // PINNED — no env override
   OLLAMA_TIMEOUT_MS: Number(process.env.DAISY_OLLAMA_TIMEOUT_MS) || 120_000, // generous: covers cold start
   OLLAMA_MAX_TOKENS: 220,
-  TIER3_MODEL: process.env.DAISY_TIER3_MODEL || '~anthropic/claude-sonnet-latest', // live-verified alias
-  FALLBACK_MODEL: 'meta-llama/llama-3.3-70b-instruct',
+  // Tier 3: frontier brain via OpenRouter — exclusive, no cloud fallback
+  TIER3_MODEL: '~anthropic/claude-sonnet-latest', // PINNED — live-verified alias, no env override
   ENDPOINT: 'https://openrouter.ai/api/v1/chat/completions',
   MAX_ATTEMPTS_PER_MODEL: 3,
   BASE_BACKOFF_MS: 500,
@@ -63,18 +70,28 @@ class SupervisorBridge {
     this.sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.apiKey = opts.apiKey !== undefined ? opts.apiKey : process.env.OPENROUTER_API_KEY || null;
     this.endpoint = opts.endpoint || POLICY.ENDPOINT;
-    // Tier-3 model chain: frontier brain first, cheap cloud fallback last.
-    this.modelChain = [
-      opts.tier3Model || POLICY.TIER3_MODEL,
-      opts.fallbackModel || POLICY.FALLBACK_MODEL,
-    ];
-    // Tier-2 gate (injectable for tests): null/false disables Ollama.
-    this.tier2 = opts.tier2 !== undefined ? opts.tier2 : {
-      url: POLICY.OLLAMA_URL,
-      model: POLICY.TIER2_OLLAMA_MODEL,
-      timeoutMs: POLICY.OLLAMA_TIMEOUT_MS,
-      maxTokens: POLICY.OLLAMA_MAX_TOKENS,
-    };
+    // PERMANENT MAPPINGS: attempts to override the pinned models throw —
+    // silently drifting a model pin is how claude-3.5-sonnet rotted.
+    for (const k of ['tier3Model', 'fallbackModel']) {
+      if (opts[k] !== undefined) throw new Error(`supervisor-bridge: '${k}' override rejected — Tier-3 is permanently pinned to ${POLICY.TIER3_MODEL} (knowledge.md §5.5)`);
+    }
+    // Tier-3 chain: the frontier brain, exclusively. No cloud fallback model.
+    this.modelChain = [POLICY.TIER3_MODEL];
+    // Tier-2 gate (injectable for tests): null/false disables Ollama. A
+    // partial object may not move the mapping — model + host are validated.
+    if (opts.tier2 === undefined) {
+      this.tier2 = {
+        url: POLICY.OLLAMA_URL,
+        model: POLICY.TIER2_OLLAMA_MODEL,
+        timeoutMs: POLICY.OLLAMA_TIMEOUT_MS,
+        maxTokens: POLICY.OLLAMA_MAX_TOKENS,
+      };
+    } else {
+      this.tier2 = opts.tier2;
+      if (this.tier2 && (this.tier2.model !== POLICY.TIER2_OLLAMA_MODEL || !String(this.tier2.url || '').startsWith('http://localhost:11434'))) {
+        throw new Error(`supervisor-bridge: tier2 mapping override rejected — permanently pinned to ${POLICY.TIER2_OLLAMA_MODEL} @ http://localhost:11434 (knowledge.md §5.5)`);
+      }
+    }
     if (!this.apiKey) {
       console.warn('[bridge] OPENROUTER_API_KEY not set — cloud calls will fail until it is');
     }

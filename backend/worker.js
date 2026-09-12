@@ -48,8 +48,9 @@ class Worker {
       attempts: 0,
       history: [],
       lastError: null,
-      injectedSkill: null,     // set by orchestrator after skill-sniping
-      skillSource: null,       // 'supervisor' | 'local-fallback'
+      injectedSkill: null,     // set by orchestrator after skill-sniping (per-task scope)
+      skillSource: null,       // 'supervisor' | 'tier2-local' | 'tier1-template' | 'local-fallback'
+      skillContent: null,      // injected skill body (per-task scope)
       filesTouched: [],
       filesWritten: [],
     };
@@ -172,6 +173,21 @@ class Worker {
   }
 
   // --- state machine ----------------------------------------------------------
+
+  /**
+   * Per-task reset, called by the pool on EVERY acquire. A skill grant is
+   * single-task scope: without this, a reused worker carries the previous
+   * task's injectedSkill and the SNIPE gate is silently bypassed — the
+   * cascade never gets consulted for the new task (and an unmatched task
+   * can inherit a WRONG skill with no supervisor say).
+   */
+  beginTask() {
+    this.state.injectedSkill = null;
+    this.state.skillSource = null;
+    this.state.skillContent = null;
+    this.state.lastError = null;
+    this.state.phase = 'claimed';
+  }
 
   /** The single transition step. Returns the worker's report for this step. */
   async step(task) {
