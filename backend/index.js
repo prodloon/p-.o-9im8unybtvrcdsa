@@ -235,6 +235,26 @@ class Orchestrator {
   /** Long-running mode. */
   async serve() {
     if (this.verbose) console.log(`[orch] serving — tick ${this.tickMs}ms, target fleet ${this.pool.targetSize}`);
+    // Orphan guard (app-bundle backend only): when the Tauri shell dies
+    // abnormally (kill -9, AppleScript quit bypassing the child-reaper),
+    // the backend would linger as a duplicate orchestrator fighting over
+    // the same queue (two backends on one SQLite = task double-runs).
+    // The repo orchestrator is spawned DETACHED by clusterctl and must NOT
+    // self-exit — it legitimately lives with ppid 1 by design.
+    // Bundle detection via our own install path (no spawn-side env needed).
+    const IN_APP_BUNDLE = __dirname.includes(`${path.sep}Contents${path.sep}Resources${path.sep}appdata`);
+    if (IN_APP_BUNDLE && process.platform !== 'win32') {
+      const shellPid = process.ppid; // number property — NOT a function
+      setInterval(() => {
+        // kill(pid, 0) = existence probe: fails once the shell is gone.
+        try {
+          process.kill(shellPid, 0);
+        } catch {
+          console.error('[orch] shell parent died — orphan guard exiting (prevents duplicate orchestrators)');
+          process.exit(0);
+        }
+      }, 5_000).unref();
+    }
     let lastTelemetry = 0;
     // eslint-disable-next-line no-constant-condition
     while (true) {

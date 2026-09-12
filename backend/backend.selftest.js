@@ -545,6 +545,40 @@ async function main() {
   }
 
   // ============================================================================
+  suite('S16: serve-mode survival + bundle orphan guard');
+  {
+    // Regression: the orphan guard once called process.ppid() — but ppid is a
+    // number property, so every --serve backend crashed 5s after spawn
+    // (TypeError inside the guard's own interval), feeding the launchd
+    // supervisor an endless heal loop. This suite spawns the REAL entrypoint
+    // in --serve mode against a temp DB and proves it (a) stays up well past
+    // the first guard tick and (b) exits cleanly on SIGTERM.
+    const { spawn } = require('child_process');
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'daisy-serve-'));
+    const child = spawn(process.execPath, [path.join(__dirname, 'index.js'), '--serve'], {
+      env: {
+        ...process.env,
+        DAISY_DATA_DIR: path.join(tmpHome, 'database'),
+        DAISY_SANDBOX_DIR: path.join(tmpHome, 'sandbox'),
+        OPENROUTER_API_KEY: '',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    // 7s > the guard's 5s tick: the regression died inside this window.
+    await new Promise((r) => setTimeout(r, 7_000));
+    check('serve-mode orchestrator survives its first orphan-guard tick', child.exitCode === null && !/ppid is not a function/.test(stderr), stderr.split('\n').slice(-2).join(' | ').slice(0, 200));
+    check('guard is bundle-scoped in source (repo serve runs must not self-exit)', fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8').includes('IN_APP_BUNDLE && process.platform'));
+
+    child.kill('SIGTERM');
+    await new Promise((r) => setTimeout(r, 3_000));
+    const gone = child.exitCode !== null || child.signalCode === 'SIGTERM';
+    check('SIGTERM exits the serve orchestrator cleanly', gone, `exitCode=${child.exitCode} signal=${child.signalCode}`);
+    try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+  }
+
+  // ============================================================================
   suite('S11: governor regression — Phase 1 battery still green');
   {
     const { execFileSync } = require('child_process');

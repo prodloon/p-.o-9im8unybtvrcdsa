@@ -183,6 +183,20 @@ fn main() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // WindowEvent::Destroyed does NOT fire on AppleScript quit / Cmd-Q
+            // during shutdown / kill of the shell — catch the app-level exit
+            // too, or the backend outlives the shell as a duplicate orchestrator.
+            if let tauri::RunEvent::Exit = event {
+                let state = app_handle.state::<BackendHandle>();
+                if let Ok(mut guard) = state.0.lock() {
+                    if let Some(mut child) = guard.take() {
+                        let _ = child.kill();
+                        println!("[shell] backend killed on app exit");
+                    }
+                }; // semicolon: drop the lock temporary before `state` (E0597)
+            }
+        });
 }
