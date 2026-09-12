@@ -579,6 +579,67 @@ async function main() {
   }
 
   // ============================================================================
+  suite('S17: supervisor log parser — timestamps, legacy era, kind precedence');
+  {
+    const { parseSupervisorLog } = require('./supervisor-log-parser');
+
+    // Fixture: mixed eras, both timestamped and legacy lines, matching the
+    // writer's exact ANSI shapes (cluster.sh log()/ok()/alert()).
+    const L = (ts, color, text) => `\x1b[${color}m[cluster${ts ? ' ' + ts : ''}]\x1b[0m ${text}`;
+    const T = (h, m, s) => `2026-09-12 ${h}:${m}:${s}`;
+    const fixture = [
+      L(T('12', '22', '20'), 36, 'supervisor: core service down — healing (idempotent boot)'),
+      L(null, 36, 'some unrelated progress line — must not match'),
+      'boot FAILED (9/9): no cluster tag at all — must be ignored',
+      L(T('12', '30', '01'), 31, '✗ boot FAILED (1/5): synthetic db preflight ENOTDIR'),
+      L(T('12', '30', '21'), 31, '✗ boot FAILED (2/5): synthetic db preflight ENOTDIR'),
+      L(T('12', '31', '05'), 31, 'supervisor: HALTED after 5 consecutive failed boots — idling (no healing)'),
+      L(null, 33, 'ALERT: Halted: 5 consecutive boot failures — healing stopped'),  // legacy-era alert
+      L(T('12', '40', '00'), 36, 'supervisor: halt cleared — booting stack'),
+      '2026-09-12 12:41:00 regular logviewer line mentioning [cluster] mid-text',
+    ].join('\n');
+
+    const { events, eras } = parseSupervisorLog(fixture);
+
+    check('S17 newest-first order, limit respected', events.length === 6, `got ${events.length}`);
+    check('S17 kinds + order (first-match precedence: HALTED before alert)',
+      events.map((e) => e.kind).join(',') === 'halt-cleared,alert,HALTED,boot-fail,boot-fail,heal',
+      events.map((e) => e.kind).join(','));
+
+    // ts extraction: timestamped lines get unix ms of the LOG's local wall time.
+    const cleared = events.find((e) => e.kind === 'halt-cleared');
+    const want = new Date('2026-09-12T12:40:00').getTime();
+    check('S17 ts parsed from log timestamp (local wall time)', cleared && cleared.ts === want,
+      cleared ? `ts=${cleared.ts} want=${want}` : 'missing');
+
+    const legacyAlert = events.find((e) => e.kind === 'alert');
+    check('S17 legacy line carries ts:null (NOT "now")', legacyAlert && legacyAlert.ts === null,
+      legacyAlert ? `ts=${legacyAlert.ts}` : 'missing');
+
+    check('S17 era tally (5 timestamped + 1 legacy among returned events)',
+      eras.timestamped === 5 && eras.legacy === 1, `ts=${eras.timestamped} legacy=${eras.legacy}`);
+
+    check('S17 ANSI stripped + prefix removed in text',
+      cleared && !cleared.text.includes('\x1b') && cleared.text.startsWith('supervisor: halt cleared'),
+      cleared && cleared.text.slice(0, 40));
+
+    const decoyFree = events.every((e) => !/must be (ignored|not match)/.test(e.text));
+    check('S17 untagged + non-event lines excluded', decoyFree, events.map((e) => e.text.slice(0, 30)).join(' | '));
+
+    // The classic precedence trap: a HALTED line is written via alert(), so it
+    // contains "ALERT:" — HALTED must win because it is declared earlier.
+    const trap = parseSupervisorLog(`\x1b[31m[cluster 2026-09-12 12:00:00]\x1b[0m ALERT: supervisor: HALTED after 3 consecutive failed boots\n`, 1);
+    check('S17 precedence trap: HALTED beats ALERT on the same line',
+      trap.events[0]?.kind === 'HALTED', trap.events[0]?.kind);
+
+    // Empty/garbage inputs must not throw.
+    const junk = parseSupervisorLog('', 6);
+    const undef = parseSupervisorLog(undefined, 6);
+    check('S17 empty/undefined input → no events, no throw',
+      junk.events.length === 0 && undef.events.length === 0);
+  }
+
+  // ============================================================================
   suite('S11: governor regression — Phase 1 battery still green');
   {
     const { execFileSync } = require('child_process');

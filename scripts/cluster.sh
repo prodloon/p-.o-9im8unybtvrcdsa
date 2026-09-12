@@ -75,7 +75,9 @@ if [ -f "$ENVFILE" ]; then
   set -a; . "$ENVFILE"; set +a
 fi
 
-log()  { printf '\033[36m[cluster]\033[0m %s\n' "$*"; }
+# Timestamped log lines — the events strip on the dashboard parses these to
+# show real per-event times. Format: [cluster YYYY-MM-DD HH:MM:SS]
+log()  { printf '\033[36m[cluster %s]\033[0m %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 ok()   { printf '\033[32m  ✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m  ⚠\033[0m %s\n' "$*"; }
 fail() { printf '\033[31m  ✗\033[0m %s\n' "$*"; }

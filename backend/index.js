@@ -29,6 +29,7 @@ const { execSync } = require('child_process');
 const { Governor, POLICY: GOV_POLICY, readProcessStats } = require('../governor/governor');
 const { WorkerPool } = require('./worker-pool');
 const { SupervisorBridge } = require('./supervisor-bridge');
+const { parseSupervisorLog } = require('./supervisor-log-parser');
 const { SkillInjector } = require('./skill-injector');
 
 const ORCH_POLICY = {
@@ -274,33 +275,33 @@ class Orchestrator {
 
   /**
    * Recent supervisor heal/halt events, parsed from the LaunchAgent log
-   * (logs/launchd-agent.log). The log is append-only and UNTIMESTAMPED, and
-   * its mtime advances on every supervisor write — so honest per-event times
-   * are not recoverable here; the strip is a SEQUENCE (newest first) and the
-   * UI shows the log's own freshness separately. Cached 5 s; newest 6 events.
+   * (logs/launchd-agent.log) via backend/supervisor-log-parser.js (pure,
+   * S17-tested). Lines written by the current cluster.sh carry real
+   * timestamps → ts is a unix ms value; lines from before the timestamping
+   * change carry ts: null (the UI shows those as time-unknown, plus a
+   * legacy footnote while any are visible). Cached 5 s; newest 6 events.
    */
   _supervisorEvents() {
     const now = Date.now();
     if (this._evAt && now - this._evAt < 5000) return this._evCache;
     this._evAt = now;
-    let lines = [];
+    let parsed = { events: [], eras: { timestamped: 0, legacy: 0 } };
     let logAge = null;
     try {
       const logPath = path.join(this.root, 'logs', 'launchd-agent.log');
-      const raw = fs.readFileSync(logPath, 'utf8').split('\n');
+      const raw = fs.readFileSync(logPath, 'utf8');
       logAge = Math.round((Date.now() - fs.statSync(logPath).mtimeMs) / 1000);
-      const rel = [[/core service down/, 'heal'], [/boot FAILED \((\d+)\//, 'boot-fail'], [/HALTED/, 'HALTED'], [/halt cleared/, 'halt-cleared'], [/ALERT:/, 'alert']];
-      for (let i = raw.length - 1; i >= 0 && lines.length < 6; i--) {
-        const L = raw[i];
-        if (!L.includes('[cluster]')) continue;
-        const hit = rel.find(([re]) => re.test(L));
-        if (hit) lines.push({ kind: hit[1], text: L.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\s*\[[^\]]*\]\s*/, '').slice(0, 90) });
-      }
+      parsed = parseSupervisorLog(raw);
     } catch {
-      lines = [];
+      parsed = { events: [], eras: { timestamped: 0, legacy: 0 } };
       logAge = null;
     }
-    this._evCache = { events: lines, logAge };
+    this._evCache = {
+      events: parsed.events,
+      logAge,
+      hasLegacy: parsed.eras.legacy > 0,
+      hasTimestamps: parsed.eras.timestamped > 0,
+    };
     return this._evCache;
   }
 

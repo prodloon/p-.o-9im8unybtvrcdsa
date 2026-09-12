@@ -269,14 +269,24 @@ export default function App() {
             <div className="space-y-1">
               {sample.supervisorEvents.events.map((ev, i) => {
                 const tone = { heal: 'bg-sky-500/20 text-sky-300', 'boot-fail': 'bg-amber-500/20 text-amber-300', HALTED: 'bg-rose-500/20 text-rose-300', alert: 'bg-rose-500/20 text-rose-300', 'halt-cleared': 'bg-emerald-500/20 text-emerald-300' }[ev.kind] || 'bg-slate-600/40 text-slate-300';
+                const time = ev.ts != null
+                  ? new Date(ev.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                  : '—:—'; // legacy line from before log timestamping
                 return (
                   <div key={i} className="flex items-center gap-2 text-xs">
+                    <span className="w-[62px] shrink-0 font-mono text-[11px] text-slate-500" title={ev.ts != null ? new Date(ev.ts).toLocaleString() : 'logged before log timestamping — time unknown'}>{time}</span>
                     <span className={`rounded px-1.5 py-0.5 font-mono ${tone}`}>{ev.kind}</span>
                     <span className="truncate text-slate-400" title={ev.text}>{ev.text}</span>
                   </div>
                 );
               })}
-              <div className="pt-1 text-[11px] text-slate-500">log updated {sample.supervisorEvents.logAge ?? '?'}s ago · newest first</div>
+              <div className="pt-1 text-[11px] text-slate-500">
+                {sample.supervisorEvents.hasTimestamps && !sample.supervisorEvents.hasLegacy
+                  ? `log updated ${sample.supervisorEvents.logAge ?? '?'}s ago · newest first`
+                  : sample.supervisorEvents.hasTimestamps
+                    ? 'older entries predate log timestamping — their time is unknown · newest first'
+                    : 'pre-timestamping log — times unknown · newest first'}
+              </div>
             </div>
           )}
         </div>
