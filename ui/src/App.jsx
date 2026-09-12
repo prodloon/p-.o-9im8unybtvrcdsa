@@ -262,6 +262,25 @@ export default function App() {
           </div>
         </div>
         <div className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4">
+          <div className="mb-1 text-xs font-medium uppercase tracking-wider text-slate-400">Supervisor events</div>
+          {(sample?.supervisorEvents?.events?.length ?? 0) === 0 ? (
+            <div className="text-sm text-slate-500">no heal/halt events in the log</div>
+          ) : (
+            <div className="space-y-1">
+              {sample.supervisorEvents.events.map((ev, i) => {
+                const tone = { heal: 'bg-sky-500/20 text-sky-300', 'boot-fail': 'bg-amber-500/20 text-amber-300', HALTED: 'bg-rose-500/20 text-rose-300', alert: 'bg-rose-500/20 text-rose-300', 'halt-cleared': 'bg-emerald-500/20 text-emerald-300' }[ev.kind] || 'bg-slate-600/40 text-slate-300';
+                return (
+                  <div key={i} className="flex items-center gap-2 text-xs">
+                    <span className={`rounded px-1.5 py-0.5 font-mono ${tone}`}>{ev.kind}</span>
+                    <span className="truncate text-slate-400" title={ev.text}>{ev.text}</span>
+                  </div>
+                );
+              })}
+              <div className="pt-1 text-[11px] text-slate-500">log updated {sample.supervisorEvents.logAge ?? '?'}s ago · newest first</div>
+            </div>
+          )}
+        </div>
+        <div className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4">
           <div className="mb-1 text-xs font-medium uppercase tracking-wider text-slate-400">Supervisor guard</div>
           <div className="space-y-1 text-sm text-slate-300">
             <div className="flex justify-between">

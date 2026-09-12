@@ -273,6 +273,38 @@ class Orchestrator {
   }
 
   /**
+   * Recent supervisor heal/halt events, parsed from the LaunchAgent log
+   * (logs/launchd-agent.log). The log is append-only and UNTIMESTAMPED, and
+   * its mtime advances on every supervisor write — so honest per-event times
+   * are not recoverable here; the strip is a SEQUENCE (newest first) and the
+   * UI shows the log's own freshness separately. Cached 5 s; newest 6 events.
+   */
+  _supervisorEvents() {
+    const now = Date.now();
+    if (this._evAt && now - this._evAt < 5000) return this._evCache;
+    this._evAt = now;
+    let lines = [];
+    let logAge = null;
+    try {
+      const logPath = path.join(this.root, 'logs', 'launchd-agent.log');
+      const raw = fs.readFileSync(logPath, 'utf8').split('\n');
+      logAge = Math.round((Date.now() - fs.statSync(logPath).mtimeMs) / 1000);
+      const rel = [[/core service down/, 'heal'], [/boot FAILED \((\d+)\//, 'boot-fail'], [/HALTED/, 'HALTED'], [/halt cleared/, 'halt-cleared'], [/ALERT:/, 'alert']];
+      for (let i = raw.length - 1; i >= 0 && lines.length < 6; i--) {
+        const L = raw[i];
+        if (!L.includes('[cluster]')) continue;
+        const hit = rel.find(([re]) => re.test(L));
+        if (hit) lines.push({ kind: hit[1], text: L.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\s*\[[^\]]*\]\s*/, '').slice(0, 90) });
+      }
+    } catch {
+      lines = [];
+      logAge = null;
+    }
+    this._evCache = { events: lines, logAge };
+    return this._evCache;
+  }
+
+  /**
    * Supervisor crash-loop guard state, read straight from the marker files
    * scripts/cluster.sh maintains (single source of truth — the backend never
    * writes guard state, it only observes). The pgrep is cached 5 s because
@@ -337,6 +369,8 @@ class Orchestrator {
       workersHibernating: this.governor.db.prepare("SELECT COUNT(*) n FROM workers WHERE state='hibernating'").get().n,
       // Supervisor healer + crash-loop guard (dashboard "Supervisor guard")
       supervisor: this._supervisorGuard(),
+      // Recent supervisor events (dashboard heal strip) + log freshness
+      supervisorEvents: this._supervisorEvents(),
     };
   }
 
