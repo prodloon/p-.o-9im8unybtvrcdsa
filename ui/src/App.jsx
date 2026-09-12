@@ -177,6 +177,7 @@ export default function App() {
   const [sample, setSample] = useState(null);
   const [connected, setConnected] = useState(false);
   const [history, setHistory] = useState([]);
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const feedRef = useRef(null);
 
   useEffect(() => {
@@ -198,12 +199,29 @@ export default function App() {
     };
   }, []);
 
+  // Heartbeat: staleness must be re-evaluated even when NO new samples
+  // arrive — during an orchestrator outage the telemetry server still
+  // answers with the last snapshot, so `connected` alone would keep the
+  // badge saying "live" over frozen data.
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
   const ramHistory = history;
 
   const pool = sample?.pool || {};
   const queue = sample?.queue || {};
   const ramPct = sample?.ramPct ?? 0;
   const ramTone = ramPct >= 80 ? 'rose' : ramPct >= 70 ? 'amber' : 'sky';
+
+  // Feed state: live = fresh samples flowing; stale = poll still answered
+  // but the payload's ts stopped advancing (orchestrator down — its
+  // snapshot is frozen at the last write, ~2–3s cadence → 5s threshold);
+  // offline = no sample with a ts at all (telemetry server unreachable).
+  const STALE_MS = 5000;
+  const staleAgeSec = sample?.ts != null ? Math.max(0, Math.round((nowTick - sample.ts) / 1000)) : null;
+  const feedState = !connected ? 'offline' : staleAgeSec == null || staleAgeSec * 1000 <= STALE_MS ? 'live' : 'stale';
 
   return (
     <div className="min-h-screen bg-slate-900 p-6 text-slate-100">
@@ -212,9 +230,12 @@ export default function App() {
           <h1 className="text-xl font-semibold tracking-tight">Daisy Cluster</h1>
           <p className="text-sm text-slate-400">
             Hybrid cloud-local multi-agent telemetry
-            <span className={`ml-2 inline-flex items-center gap-1 ${connected ? 'text-emerald-400' : 'text-rose-400'}`}>
-              <span className={`inline-block h-2 w-2 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-rose-400'}`} />
-              {connected ? 'live' : 'offline'}
+            <span
+              className={`ml-2 inline-flex items-center gap-1 ${feedState === 'live' ? 'text-emerald-400' : feedState === 'stale' ? 'text-amber-400' : 'text-rose-400'}`}
+              title={feedState === 'stale' ? 'telemetry server answers, but the orchestrator snapshot is frozen — supervisor should heal within one tick (15s)' : undefined}
+            >
+              <span className={`inline-block h-2 w-2 rounded-full ${feedState === 'live' ? 'animate-pulse bg-emerald-400' : feedState === 'stale' ? 'bg-amber-400' : 'bg-rose-400'}`} />
+              {feedState === 'live' ? 'live' : feedState === 'stale' ? `stale — orchestrator unreachable · data ${staleAgeSec}s old` : 'offline'}
             </span>
           </p>
         </div>
