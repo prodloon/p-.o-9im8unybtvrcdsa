@@ -46,7 +46,7 @@ echo "▶ 3/4 swapping in the freshly built binary + ad-hoc sign…"
 cp "$SRC/daisy-cluster" "$BUNDLED/Contents/MacOS/daisy-cluster"
 codesign --force -s - "$BUNDLED" 2>/dev/null || true
 
-echo "▶ 4/4 installing to $INSTALLED…"
+echo "▶ 4/4 installing to ${INSTALLED}…" # brace the var: bash parses $INSTALLED… (ellipsis) as one name under set -u
 [ -d "$INSTALLED" ] && rm -rf "$INSTALLED"
 ditto "$BUNDLED" "$INSTALLED"
 
