@@ -17,7 +17,24 @@ Architecture and session history live in `knowledge.md`; this file is the
 
 ## 1. Starting the cluster
 
-**One command — the whole stack** (preferred):
+**Preferred: let it run itself** (login autostart + self-heal):
+```bash
+cd ~/daisy-chain
+./scripts/cluster.sh install-agent      # once — survives reboots, heals crashes
+./scripts/cluster.sh uninstall-agent    # remove it (stops services unless --keep-running)
+```
+The agent runs `scripts/cluster.sh supervise`: boot at login, then a 15 s
+watchdog that re-runs the (idempotent) boot when a core service dies.
+Consequences you should know:
+- `./scripts/cluster.sh stop` **pauses the supervisor for 10 min** (otherwise
+  the healer would re-boot the stack within seconds). Auto-resumes after;
+  `start`/`restart` clear the pause immediately.
+- The supervisor itself is launchd-protected: kill it and launchd respawns it.
+- Healing covers orchestrator + telemetry (+ Ollama when the agent owns it)
+  — the dashboard (vite) is a viewer and is not re-spawned by the healer.
+- Logs: `logs/launchd-agent.log` (supervisor) — status shows the agent line.
+
+**One command — the whole stack** (manual control):
 ```bash
 cd ~/daisy-chain
 ./clusterctl.sh start --shell   # desktop shell + dashboard + telemetry

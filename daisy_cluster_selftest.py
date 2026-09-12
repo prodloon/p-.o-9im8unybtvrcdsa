@@ -237,6 +237,21 @@ def suite_control_script():
     help_r = subprocess.run([ctl, "logs", "all", "1"], capture_output=True, text=True, timeout=30)
     check("ctl", "logs command is graceful", help_r.returncode == 0)
 
+    # LaunchAgent (login autostart + self-heal) — artifacts must be valid
+    # whenever present; the agent itself may legitimately be uninstalled.
+    cluster_sh = os.path.join(ROOT, "scripts", "cluster.sh")
+    agent_label = "com.daisy.cluster"
+    plist = os.path.expanduser(f"~/Library/LaunchAgents/{agent_label}.plist")
+    if os.path.exists(plist):
+        lint = subprocess.run(["plutil", "-lint", plist], capture_output=True, text=True, timeout=30)
+        check("ctl", "agent plist lints clean", lint.returncode == 0, lint.stderr[:120])
+        loaded = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{agent_label}"],
+                                capture_output=True, text=True, timeout=30)
+        check("ctl", "agent is loaded with the cluster plist", loaded.returncode == 0)
+    sup = subprocess.run(["bash", "-n", cluster_sh], capture_output=True, text=True, timeout=30)
+    check("ctl", "cluster.sh (supervisor) syntax clean",
+          os.path.exists(cluster_sh) and sup.returncode == 0, sup.stderr[:120])
+
 
 def suite_frozen_files():
     """The legacy daisy_*.py files must be untouched by all cluster work."""
