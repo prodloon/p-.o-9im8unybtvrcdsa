@@ -640,6 +640,58 @@ async function main() {
   }
 
   // ============================================================================
+  suite('S18: supervisor root resolution — app mode reads the supervised checkout');
+  {
+    const { resolveSupervisorRoot } = require('./supervisor-root');
+    const os = require('os');
+
+    // Hermetic: point HOME at a temp tree so the real machine's layout can
+    // never influence results. Save/restore everything we touch.
+    const saved = { HOME: process.env.HOME, DAISY_DATA_DIR: process.env.DAISY_DATA_DIR, DAISY_SUPERVISOR_ROOT: process.env.DAISY_SUPERVISOR_ROOT };
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 's18-home-'));
+    const fakeCheckout = path.join(tmpHome, 'daisy-chain');
+    fs.mkdirSync(path.join(fakeCheckout, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(fakeCheckout, 'scripts', 'cluster.sh'), '#!/bin/bash\n');
+    try {
+      // 1. env override wins when it is a daisy tree.
+      process.env.HOME = tmpHome;
+      process.env.DAISY_SUPERVISOR_ROOT = fakeCheckout;
+      process.env.DAISY_DATA_DIR = path.join(tmpHome, 'appdata');
+      let r = resolveSupervisorRoot(tmpHome);
+      check('S18 env override wins (valid daisy tree)', r.source === 'env' && r.root === path.resolve(fakeCheckout), JSON.stringify(r));
+
+      // 2. env override that is NOT a daisy tree must fall through, not crash.
+      process.env.DAISY_SUPERVISOR_ROOT = path.join(tmpHome, 'empty-dir');
+      fs.mkdirSync(path.join(tmpHome, 'empty-dir'));
+      r = resolveSupervisorRoot(tmpHome);
+      check('S18 bogus env override falls through (no crash, not env)', r.source !== 'env', JSON.stringify(r));
+
+      // 3. app mode + checkout in HOME → the supervised checkout.
+      delete process.env.DAISY_SUPERVISOR_ROOT;
+      r = resolveSupervisorRoot(tmpHome);
+      check('S18 app mode resolves ~/daisy-chain checkout', r.source === 'checkout' && r.root === fakeCheckout, JSON.stringify(r));
+
+      // 4. app mode without a checkout → own root (still never throws).
+      fs.rmSync(fakeCheckout, { recursive: true, force: true });
+      r = resolveSupervisorRoot(tmpHome);
+      check('S18 app mode without checkout → self', r.source === 'self' && r.root === tmpHome, JSON.stringify(r));
+
+      // 5. repo mode (no DAISY_DATA_DIR) must NOT adopt HOME's checkout.
+      fs.mkdirSync(path.join(fakeCheckout, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(fakeCheckout, 'scripts', 'cluster.sh'), '#!/bin/bash\n');
+      delete process.env.DAISY_DATA_DIR;
+      r = resolveSupervisorRoot(tmpHome);
+      check('S18 repo mode ignores HOME checkout (stays self)', r.source === 'self', JSON.stringify(r));
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  // ============================================================================
   suite('S11: governor regression — Phase 1 battery still green');
   {
     const { execFileSync } = require('child_process');

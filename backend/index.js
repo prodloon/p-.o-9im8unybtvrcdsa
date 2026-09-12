@@ -30,6 +30,7 @@ const { Governor, POLICY: GOV_POLICY, readProcessStats } = require('../governor/
 const { WorkerPool } = require('./worker-pool');
 const { SupervisorBridge } = require('./supervisor-bridge');
 const { parseSupervisorLog } = require('./supervisor-log-parser');
+const { resolveSupervisorRoot } = require('./supervisor-root');
 const { SkillInjector } = require('./skill-injector');
 
 const ORCH_POLICY = {
@@ -274,6 +275,18 @@ class Orchestrator {
   }
 
   /**
+   * Where the supervisor (scripts/cluster.sh under launchd) actually lives.
+   * In app mode that is the operator's checkout, NOT this.root — the bundle
+   * has no logs/ and its database/ is redirected. Resolution rules and
+   * source labels: backend/supervisor-root.js. Memoized (env is fixed at
+   * spawn, so the answer cannot change mid-process).
+   */
+  _supervisorRoot() {
+    if (!this._supRootCache) this._supRootCache = resolveSupervisorRoot(this.root);
+    return this._supRootCache;
+  }
+
+  /**
    * Recent supervisor heal/halt events, parsed from the LaunchAgent log
    * (logs/launchd-agent.log) via backend/supervisor-log-parser.js (pure,
    * S17-tested). Lines written by the current cluster.sh carry real
@@ -288,7 +301,7 @@ class Orchestrator {
     let parsed = { events: [], eras: { timestamped: 0, legacy: 0 } };
     let logAge = null;
     try {
-      const logPath = path.join(this.root, 'logs', 'launchd-agent.log');
+      const logPath = path.join(this._supervisorRoot().root, 'logs', 'launchd-agent.log');
       const raw = fs.readFileSync(logPath, 'utf8');
       logAge = Math.round((Date.now() - fs.statSync(logPath).mtimeMs) / 1000);
       parsed = parseSupervisorLog(raw);
@@ -301,6 +314,7 @@ class Orchestrator {
       logAge,
       hasLegacy: parsed.eras.legacy > 0,
       hasTimestamps: parsed.eras.timestamped > 0,
+      rootSource: this._supervisorRoot().source,
     };
     return this._evCache;
   }
@@ -312,7 +326,7 @@ class Orchestrator {
    * this runs inside the 1 Hz telemetry path.
    */
   _supervisorGuard() {
-    const runDir = path.join(this.root, '.run');
+    const runDir = path.join(this._supervisorRoot().root, '.run');
     const now = Date.now();
     if (!this._supCheckAt || now - this._supCheckAt > 5000) {
       try {

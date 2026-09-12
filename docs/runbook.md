@@ -202,7 +202,7 @@ contract lives in `knowledge.md` §5.5 — the COST LAW. Boot-order checks
 
 ```bash
 node governor/governor.selftest.js     # 56 checks
-node backend/backend.selftest.js       # 96 checks (incl. S16 orphan-guard + S17 log-parser suites)
+node backend/backend.selftest.js       # 101 checks (incl. S16 orphan-guard, S17 log-parser, S18 supervisor-root suites)
 ~/daisy_env/bin/python daisy_cluster_selftest.py   # end-to-end, incl. clusterctl
 ```
 
