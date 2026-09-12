@@ -46,6 +46,81 @@ function Spark({ data, tone = '#38bdf8' }) {
   );
 }
 
+const fmtBytes = (b) => {
+  if (b == null) return '—';
+  if (b >= 1024 ** 3) return `${(b / 1024 ** 3).toFixed(2)} GB`;
+  if (b >= 1024 ** 2) return `${(b / 1024 ** 2).toFixed(1)} MB`;
+  if (b >= 1024) return `${(b / 1024).toFixed(1)} KB`;
+  return `${b} B`;
+};
+
+const fmtBusy = (ms) => {
+  if (ms == null) return '—';
+  if (ms >= 60_000) return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${ms}ms`;
+};
+
+const PHASE_TONES = {
+  working: 'text-emerald-400',
+  waiting_skill: 'text-amber-400',
+  claimed: 'text-sky-400',
+  idle: 'text-slate-400',
+  done: 'text-slate-400',
+  failed: 'text-rose-400',
+};
+
+/** Per-agent fleet table: CPU / state size / busy time for every live worker. */
+const AgentTable = React.memo(function AgentTable({ workers, hostStats, perWorkerRss }) {
+  const rows = workers || [];
+  const totalCpu = rows.reduce((a, w) => a + (w.cpuPct || 0), 0);
+  const totalState = rows.reduce((a, w) => a + (w.stateBytes || 0), 0);
+  return (
+    <div className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4">
+      <div className="mb-2 flex items-baseline justify-between">
+        <span className="text-xs font-medium uppercase tracking-wider text-slate-400">Agents ({rows.length})</span>
+        <span className="text-xs text-slate-500">
+          Σ cpu {totalCpu.toFixed(1)}% · Σ state {fmtBytes(totalState)}
+          {hostStats?.rssBytes ? ` · host rss ${fmtBytes(hostStats.rssBytes)} (~${fmtBytes(perWorkerRss)}/agent)` : ''}
+        </span>
+      </div>
+      {rows.length === 0 ? (
+        <div className="py-3 text-sm text-slate-500">no live workers — fleet idle</div>
+      ) : (
+        <div className="max-h-56 overflow-y-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="text-slate-500">
+              <tr className="border-b border-slate-700/60">
+                <th className="py-1.5 pr-3 font-medium">agent</th>
+                <th className="py-1.5 pr-3 font-medium">phase</th>
+                <th className="py-1.5 pr-3 text-right font-medium">cpu %</th>
+                <th className="py-1.5 pr-3 text-right font-medium">state</th>
+                <th className="py-1.5 pr-3 text-right font-medium">busy</th>
+                <th className="py-1.5 text-right font-medium">steps</th>
+              </tr>
+            </thead>
+            <tbody className="font-mono text-slate-300">
+              {rows.map((w) => (
+                <tr key={w.id} className="border-b border-slate-800/60 last:border-0">
+                  <td className="py-1.5 pr-3">{w.id}</td>
+                  <td className={`py-1.5 pr-3 ${PHASE_TONES[w.phase] || 'text-slate-400'}`}>{w.phase}</td>
+                  <td className="py-1.5 pr-3 text-right">{w.cpuPct == null ? '—' : w.cpuPct.toFixed(1)}</td>
+                  <td className="py-1.5 pr-3 text-right">{fmtBytes(w.stateBytes)}</td>
+                  <td className="py-1.5 pr-3 text-right">{fmtBusy(w.busyMs)}</td>
+                  <td className="py-1.5 text-right">{w.attempts ?? 0}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="mt-2 text-[10px] text-slate-600">
+        cpu = attributed share of the host event loop · state = exact serialized size (what hibernation writes)
+      </div>
+    </div>
+  );
+});
+
 export default function App() {
   const [sample, setSample] = useState(null);
   const [connected, setConnected] = useState(false);
@@ -134,6 +209,10 @@ export default function App() {
             <div className="flex justify-between"><span>Hibernating workers</span><span className="font-mono">{sample?.workersHibernating ?? 0}</span></div>
           </div>
         </div>
+      </div>
+
+      <div className="mt-4">
+        <AgentTable workers={pool.workers} hostStats={sample?.hostStats} perWorkerRss={sample?.hostStats?.perWorkerRss} />
       </div>
     </div>
   );

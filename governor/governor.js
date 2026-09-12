@@ -40,6 +40,38 @@ const POLL_INTERVAL_MS = 2_000; // production poll cadence
 const DEFAULT_TOTAL_RAM = 16 * 1024 * 1024 * 1024; // 16 GiB; overridable
 const DEFAULT_DB_PATH = path.join(__dirname, '..', 'database', 'agent-states.sqlite');
 
+/**
+ * Read CPU% and RSS of one process without npm deps.
+ * macOS: ps -o %cpu,rss -p <pid> (RSS in 1024-byte blocks).
+ * Linux: /proc/<pid>/stat + /proc/<pid>/status.
+ * Injected via `new Governor({ procStatsReader })` in the selftests.
+ */
+function readProcessStats(pid) {
+  try {
+    if (process.platform === 'darwin') {
+      const out = execFileSync('ps', ['-o', '%cpu=,rss=', '-p', String(pid)], { encoding: 'utf8' });
+      const [cpuStr, rssStr] = out.trim().split(/\s+/);
+      const cpuPct = Number(cpuStr);
+      const rssBytes = Number(rssStr) * 1024;
+      return { cpuPct: Number.isFinite(cpuPct) ? cpuPct : null, rssBytes: Number.isFinite(rssBytes) ? rssBytes : null };
+    }
+    if (process.platform === 'linux') {
+      // %CPU needs two samples; first pass reports cumulative ticks → null cpu.
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const parts = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      const hz = 100;
+      const ticks = Number(parts[11]) + Number(parts[12]); // utime + stime
+      const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+      const m = status.match(/^VmRSS:\s+(\d+) kB/m);
+      const rssBytes = m ? Number(m[1]) * 1024 : null;
+      return { cpuPct: null, rssBytes, _ticks, _hz: hz };
+  }
+  } catch {
+    /* process gone or ps unavailable — telemetry is best-effort */
+  }
+  return { cpuPct: null, rssBytes: null };
+}
+
 /** Read total+used system RAM on macOS/Linux without npm deps. */
 function systemRamReader() {
   if (process.platform === 'darwin') {
@@ -75,7 +107,10 @@ CREATE TABLE IF NOT EXISTS workers (
     priority       INTEGER NOT NULL DEFAULT 5,
     ram_bytes      INTEGER,
     spawned_at     INTEGER NOT NULL,
-    last_heartbeat INTEGER NOT NULL
+    last_heartbeat INTEGER NOT NULL,
+    cpu_pct        REAL,            -- attributed CPU%% of the host over the last interval
+    state_bytes    INTEGER,         -- exact serialized in-process state size
+    busy_ms        INTEGER NOT NULL DEFAULT 0  -- cumulative busy time inside step()
 );
 CREATE TABLE IF NOT EXISTS worker_states (
     worker_id     TEXT PRIMARY KEY REFERENCES workers(id) ON DELETE CASCADE,
@@ -112,6 +147,7 @@ CREATE TABLE IF NOT EXISTS skill_events (
     outcome    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_workers_state ON workers(state, priority);
+CREATE INDEX IF NOT EXISTS idx_workers_usage ON workers(state, cpu_pct);
 CREATE INDEX IF NOT EXISTS idx_queue_status  ON task_queue(status);
 CREATE INDEX IF NOT EXISTS idx_lease_expiry  ON task_queue(lease_expires);
 `;
@@ -127,6 +163,7 @@ class Governor {
   constructor(opts = {}) {
     this.dbPath = opts.dbPath || DEFAULT_DB_PATH;
     this.ramReader = opts.ramReader || systemRamReader;
+    this.procStatsReader = opts.procStatsReader || readProcessStats;
     this.clock = opts.clock || (() => Date.now());
     this.silent = !!opts.silent;
 
@@ -134,6 +171,17 @@ class Governor {
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA foreign_keys = ON;');
+    // Upgrade pre-usage databases in place BEFORE applying the schema — the
+    // schema creates an index on cpu_pct, which only exists once the ALTERs
+    // below have run. On a fresh DB the table doesn't exist yet, so this is
+    // skipped and CREATE TABLE provides the columns directly.
+    const hasWorkers = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='workers'").get();
+    if (hasWorkers) {
+      const cols = this.db.prepare('PRAGMA table_info(workers)').all().map((c) => c.name);
+      if (!cols.includes('cpu_pct')) this.db.exec("ALTER TABLE workers ADD COLUMN cpu_pct REAL");
+      if (!cols.includes('state_bytes')) this.db.exec("ALTER TABLE workers ADD COLUMN state_bytes INTEGER");
+      if (!cols.includes('busy_ms')) this.db.exec("ALTER TABLE workers ADD COLUMN busy_ms INTEGER NOT NULL DEFAULT 0");
+    }
     this.db.exec(SCHEMA);
 
     this.spawnBlocked = false;
@@ -178,7 +226,43 @@ class Governor {
     return true;
   }
 
-  /** node:sqlite binds only primitives — serialize objects defensively. */
+  /**
+   * Stats heartbeat: persist per-worker usage alongside the liveness beat.
+   * `cpuPct` is CPU% of the HOST attributed to this worker over the last
+   * interval (workers are in-process state machines — see knowledge.md §4);
+   * `stateBytes` is the exact serialized size of its in-process state.
+   * Pass null for a field to keep the stored value (partial updates OK).
+   */
+  statsHeartbeat(workerId, { cpuPct = null, stateBytes = null, busyMs = null } = {}) {
+    const now = this.clock();
+    const res = this.db
+      .prepare(
+        `UPDATE workers SET
+           last_heartbeat = ?,
+           cpu_pct     = COALESCE(?, cpu_pct),
+           state_bytes = COALESCE(?, state_bytes),
+           busy_ms     = COALESCE(?, busy_ms)
+         WHERE id = ?`
+      )
+      .run(now, cpuPct, stateBytes, busyMs, workerId);
+    if (res.changes > 0) return true;
+    this.registerWorker(workerId, 'unregistered', { priority: 5 });
+    return this.statsHeartbeat(workerId, { cpuPct, stateBytes, busyMs });
+  }
+
+  /** Fleet usage snapshot for the telemetry file / per-agent UI table. */
+  workerStatsSnapshot(limit = 200) {
+    const rows = this.db
+      .prepare(
+        `SELECT id, kind, state, priority, cpu_pct AS cpuPct, state_bytes AS stateBytes,
+                busy_ms AS busyMs, last_heartbeat AS lastHeartbeat
+         FROM workers
+         ORDER BY cpu_pct DESC, id ASC
+         LIMIT ?`
+      )
+      .all(limit);
+    return rows;
+  }  /** node:sqlite binds only primitives — serialize objects defensively. */
   _serialize(value) {
     if (value == null) return null;
     if (typeof value === 'string') return value;
@@ -388,6 +472,7 @@ class Governor {
 module.exports = {
   Governor,
   systemRamReader,
+  readProcessStats,
   SCHEMA,
   POLICY: {
     RAM_HIBERNATE_PCT,

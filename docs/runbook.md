@@ -63,13 +63,23 @@ LaunchAgent/cron-driven operation without a resident process.
 
 - **Live metrics:** `database/telemetry.json` (1 Hz, atomic rename) or
   `curl http://127.0.0.1:6292/api/telemetry` with the telemetry server up.
+- **Per-agent table:** the dashboard's AGENTS panel renders `pool.workers[]`
+  from telemetry — one row per agent: phase, attributed cpu %, exact state
+  size, cumulative busy time, steps. Memory attribution: workers are
+  in-process state machines, so `cpuPct` is the agent's share of the host
+  event loop (busy delta / interval) and RSS is the host process split
+  evenly per live agent. `stateBytes` is exactly what hibernation writes
+  to `worker_states`.
 - **Audit trail:** `database/agent-states.sqlite`
   - `governor_log` — hibernations, reaps, spawn blocks, lease requeues
   - `skill_events` — every skill injection (source: supervisor / local-fallback)
   - `task_queue` — full task history with attempts and outcomes
+  - `workers.cpu_pct / state_bytes / busy_ms` — per-agent usage history
 - **Quick introspection:**
   ```bash
   node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('database/agent-states.sqlite');console.table(db.prepare('SELECT event,COUNT(*) n FROM governor_log GROUP BY event').all())"
+  # heaviest agents by serialized state:
+  node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('database/agent-states.sqlite');console.table(db.prepare('SELECT id,kind,state,cpu_pct,state_bytes,busy_ms FROM workers ORDER BY state_bytes DESC LIMIT 10').all())"
   ```
 
 ## 5. Stopping

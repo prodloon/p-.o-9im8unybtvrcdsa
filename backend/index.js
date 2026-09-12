@@ -25,7 +25,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { Governor, POLICY: GOV_POLICY } = require('../governor/governor');
+const { Governor, POLICY: GOV_POLICY, readProcessStats } = require('../governor/governor');
 const { WorkerPool } = require('./worker-pool');
 const { SupervisorBridge } = require('./supervisor-bridge');
 const { SkillInjector } = require('./skill-injector');
@@ -51,7 +51,15 @@ class Orchestrator {
     // The orchestrator is itself a governor-tracked actor (FK on task_queue.leased_by
     // requires a real workers row for the leases it holds).
     this.governor.registerWorker('orchestrator', 'orchestrator', { priority: 1 });
-    this.pool = new WorkerPool({ governor: this.governor, root: opts.sandboxRoot || path.join(this.root, 'daisy_sandbox_cluster'), targetSize: opts.targetSize || 8 });
+    // The pool shares the governor's clock (fake in tests) and reads the real
+    // host process stats (RSS/CPU of this Node process) for per-agent telemetry.
+    this.pool = new WorkerPool({
+      governor: this.governor,
+      root: opts.sandboxRoot || path.join(this.root, 'daisy_sandbox_cluster'),
+      targetSize: opts.targetSize || 8,
+      clock: this.governor.clock,
+      hostStatsReader: () => readProcessStats(process.pid),
+    });
     this.injector = new SkillInjector({
       skillbaseDir: opts.skillbaseDir || path.join(this.root, 'skillbase'),
       governor: this.governor,
@@ -118,6 +126,7 @@ class Orchestrator {
     this._cycle += 1;
     this.governor.heartbeat('orchestrator'); // keep our own row fresh
     const gov = this.governor.tick(); // watchdog: hysteresis, spawn block, reapers
+    this.pool.heartbeatAll(); // per-agent CPU/state accounting (dashboard fleet table)
     const stats = { cycle: this._cycle, ramPct: gov.pct, hibernated: gov.hibernated, tasksDone: 0, tasksFailed: 0, sniped: 0, cloud: 0, local: 0 };
 
     if (this.governor.isSpawnBlocked() && this.verbose) {
@@ -184,6 +193,8 @@ class Orchestrator {
       }
     }
 
+    this.pool.heartbeatAll(); // end-of-cycle pass: workers spawned mid-cycle get usage rows too
+
     if (this.verbose) {
       console.log(
         `[orch] cycle ${stats.cycle}: ram=${stats.ramPct}% tasks=${stats.tasksDone}✓/${stats.tasksFailed}✗ skills=${stats.sniped} (cloud=${stats.cloud}, local=${stats.local})`
@@ -217,6 +228,7 @@ class Orchestrator {
       ts: Date.now(),
       cycle: this._cycle,
       pool: this.pool.snapshot(),
+      hostStats: this.pool._lastHostStats, // CPU/RSS of the backend process itself
       ramPct: Math.round((r.usedBytes / r.totalBytes) * 1000) / 10,
       spawnBlocked: this.governor.isSpawnBlocked(),
       queue: {

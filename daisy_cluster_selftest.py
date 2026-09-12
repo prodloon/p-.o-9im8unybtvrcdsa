@@ -59,14 +59,15 @@ def suite_governor_battery():
     print("== SUITE 1: GOVERNOR BATTERY (node) ==")
     code, out, _err = run_node("governor/governor.selftest.js")
     check("governor", "battery exits 0", code == 0)
-    check("governor", "43/43 checks pass", "43 passed, 0 failed" in out)
+    check("governor", "56/56 checks pass", "56 passed, 0 failed" in out)
+    check("governor", "covers per-worker usage suite", "per-worker usage" in out)
 
 
 def suite_backend_battery():
     print("== SUITE 2: BACKEND BATTERY (node) ==")
     code, out, _err = run_node("backend/backend.selftest.js")
     check("backend", "battery exits 0", code == 0)
-    check("backend", "47/47 checks pass", "47 passed, 0 failed" in out)
+    check("backend", "61/61 checks pass", "61 passed, 0 failed" in out)
     check("backend", "covers SNIPE gate",
           any("SNIPE" in line for line in out.splitlines()))
     check("backend", "covers cloud fallback chain",
@@ -127,6 +128,7 @@ def suite_live_pipeline():
           workers: db.prepare('SELECT COUNT(*) n FROM workers').get().n,
           tasks: db.prepare('SELECT COUNT(*) n FROM task_queue').get().n,
           skills: db.prepare('SELECT COUNT(*) n FROM skill_events').get().n,
+          usage_rows: db.prepare('SELECT COUNT(*) n FROM workers WHERE cpu_pct IS NOT NULL AND state_bytes IS NOT NULL').get().n,
         }}));
         db.close();
     """], capture_output=True, text=True, timeout=30)
@@ -136,6 +138,9 @@ def suite_live_pipeline():
         check("live", "WAL mode active", info["wal"]["journal_mode"] == "wal")
         check("live", "workers tracked", info["workers"] >= 1)
         check("live", "task history recorded", info["tasks"] >= 1)
+        # Per-agent usage columns (added with the dashboard fleet table):
+        check("live", "worker usage columns populated", info["usage_rows"] >= 1,
+              f"rows with cpu/state data: {info.get('usage_rows')}")
     except (ValueError, KeyError):
         check("live", "sqlite introspection", False, integ.stdout[:120] + integ.stderr[:120])
 
@@ -154,7 +159,17 @@ def suite_telemetry():
             check("telemetry", "ramPct sane", isinstance(tele.get("ramPct"), (int, float))
                   and 0 <= tele["ramPct"] <= 100)
             check("telemetry", "pool snapshot shape",
-                  {"size", "targetSize", "spawnBlocked", "byPhase"} <= set(tele.get("pool", {})))
+                  {"size", "targetSize", "spawnBlocked", "byPhase", "workers"} <= set(tele.get("pool", {})))
+            # Per-agent usage rows (the dashboard's fleet table source):
+            workers = tele.get("pool", {}).get("workers")
+            check("telemetry", "pool.workers is a list", isinstance(workers, list))
+            if isinstance(workers, list) and workers:
+                first = workers[0]
+                need = {"id", "kind", "phase", "attempts", "cpuPct", "stateBytes", "busyMs"}
+                check("telemetry", "agent rows carry usage fields", need <= set(first))
+                check("telemetry", "stateBytes sane", isinstance(first.get("stateBytes"), int) and first["stateBytes"] > 0)
+                check("telemetry", "hostStats present", "hostStats" in tele and
+                      isinstance(tele["hostStats"].get("rssBytes"), int))
         except ValueError:
             check("telemetry", "telemetry.json parses", False)
     else:

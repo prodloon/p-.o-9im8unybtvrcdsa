@@ -23,13 +23,19 @@ class WorkerPool {
    * @param {number} [opts.targetSize]  desired steady-state fleet size (config, not hardcode)
    * @param {number} [opts.maxSize]     absolute ceiling regardless of RAM
    */
-  constructor({ governor, root = process.cwd(), targetSize = 8, maxSize = 100 }) {
+  constructor({ governor, root = process.cwd(), targetSize = 8, maxSize = 100, clock, hostStatsReader }) {
     this.governor = governor;
     this.root = root;
     this.targetSize = targetSize;
     this.maxSize = maxSize;
     this.workers = new Map(); // id -> Worker
     this._seq = 0;
+    // Per-agent usage telemetry (knowledge.md §6): the clock and host-stats
+    // reader are injectable so the selftest can verify attribution deterministically.
+    this.clock = clock || (() => Date.now());
+    this.hostStatsReader = hostStatsReader || (() => ({ cpuPct: null, rssBytes: null }));
+    this._lastStatsAt = 0;
+    this._lastHostStats = { cpuPct: null, rssBytes: null };
   }
 
   _nextId(kind) {
@@ -65,17 +71,76 @@ class WorkerPool {
     return n;
   }
 
-  /** Fleet snapshot for telemetry (Phase 5 UI will stream this). */
+  /** Fleet snapshot for telemetry (Phase 5 UI streams this). */
   snapshot() {
     return {
       size: this.workers.size,
       targetSize: this.targetSize,
+      maxSize: this.maxSize,
       spawnBlocked: this.governor.isSpawnBlocked(),
       byPhase: [...this.workers.values()].reduce((acc, w) => {
         acc[w.state.phase] = (acc[w.state.phase] || 0) + 1;
         return acc;
       }, {}),
+      // Per-agent usage rows for the dashboard's fleet table. cpuPct is the
+      // last attributed value from heartbeatAll(); stateBytes/busyMs are
+      // measured live (they are owned per-worker data, always current).
+      workers: [...this.workers.values()].map((w) => {
+        const u = w.getUsage();
+        return {
+          id: w.id,
+          kind: w.kind,
+          phase: w.state.phase,
+          attempts: u.attempts,
+          cpuPct: w.lastCpuPct ?? null,
+          stateBytes: u.stateBytes,
+          busyMs: u.busyMs,
+        };
+      }),
+      hostStats: this._lastHostStats,
     };
+  }
+
+  /**
+   * Stats heartbeat for the whole fleet — call once per orchestrator cycle.
+   *
+   * Attribution (workers are in-process state machines sharing one event
+   * loop, so true per-process CPU/RSS does not exist — see knowledge.md §4):
+   *   cpuPct     = worker's share of the host event loop over the interval
+   *                (busyMs delta / interval × 100 — owned, sums to ≤100%)
+   *   stateBytes = exact serialized state size (what hibernation would store)
+   *   RSS        = host process RSS split evenly across the live fleet
+   * Values land in `workers` via governor.statsHeartbeat() and in the
+   * snapshot for the per-agent dashboard table.
+   */
+  heartbeatAll() {
+    const now = this.clock();
+    const dtMs = this._lastStatsAt ? Math.max(1, now - this._lastStatsAt) : null;
+    const hostStats = this.hostStatsReader() || { cpuPct: null, rssBytes: null };
+    const perWorkerRss =
+      hostStats.rssBytes && this.workers.size > 0
+        ? Math.round(hostStats.rssBytes / this.workers.size)
+        : null;
+
+    for (const w of this.workers.values()) {
+      let cpuPct = null;
+      if (dtMs) {
+        const busyDelta = w.busyMs - (w._lastBusyMs ?? 0);
+        w._lastBusyMs = w.busyMs;
+        cpuPct = Math.round(Math.min(100, (busyDelta / dtMs) * 100) * 10) / 10;
+      }
+      w.lastCpuPct = cpuPct;
+      const usage = w.getUsage();
+      this.governor.statsHeartbeat(w.id, {
+        cpuPct,
+        stateBytes: usage.stateBytes,
+        busyMs: usage.busyMs,
+      });
+    }
+
+    this._lastStatsAt = now;
+    this._lastHostStats = { cpuPct: hostStats.cpuPct, rssBytes: hostStats.rssBytes, perWorkerRss };
+    return { hostStats: this._lastHostStats, count: this.workers.size };
   }
 
   /**

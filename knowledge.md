@@ -14,6 +14,7 @@
 - 2026-09-11: To use the real cloud: export OPENROUTER_API_KEY (never commit). Without it the cluster runs fully on local keyword sniping — verified working end-to-end via CLI.
 - 2026-09-11: Phase 5 delivered. Telemetry pipeline: orchestrator writes `database/telemetry.json` (1 Hz, atomic tmp+rename) in both --serve and one-shot modes; dual-transport UI — Tauri native IPC (`telemetry://metrics` from src-tauri/main.rs emit loop) or loopback HTTP via `backend/telemetry-server.js` (:6292) under plain Vite; React 18 + Tailwind v4 dashboard (`ui/`) with 500ms throttled commits, SVG sparkline, gauge grid. Tauri v2 shell compiles (`cargo check` green; icon extracted from the legacy DaisyChain.app icns; child-process reaper on window close). UI production build verified (`vite build`, 1s).
 - 2026-09-11: Phase 6 delivered. `daisy_cluster_selftest.py` (NEW file — the standing `daisy_selftest.py` stays byte-identical per the freeze rule; battery asserts that freeze): 6 suites, 40 checks — governor battery, backend battery, live end-to-end pipeline via real CLI + real SQLite (integrity_check, WAL, history), telemetry file+HTTP contract, shell artifacts incl. `cargo check`, frozen-file tripwire. `docs/runbook.md` written (start/feed/monitor/stop/verify).
+- 2026-09-11: Per-agent CPU/RSS telemetry delivered end-to-end: governor schema (`cpu_pct`, `state_bytes`, `busy_ms` + in-place migration), `statsHeartbeat`/`workerStatsSnapshot`, `readProcessStats` (ps//proc), worker `busyMs` accounting + `getUsage()`, pool `heartbeatAll()` with host-CPU/RSS attribution (in-process workers ⇒ event-loop busy share + even RSS split), orchestrator wires both; dashboard gained the per-agent fleet table. Batteries: governor 56/56, backend 61/61, cluster 46/46 (Python battery pins the new counts + a usage_rows check). Live restart verified: attributed cpu 23.1% on a real task; state_bytes grows when a skill is injected (921 B). Gotchas: CREATE-IF-NOT-EXISTS can't add columns (ALTER migration must run BEFORE schema for the cpu_pct index); node:sqlite refuses double-quoted string literals in SQL; telemetry HTTP needs `Cache-Control: no-store` or browsers serve stale gauges; one-shot cycles run end-of-cycle heartbeatAll so usage rows always exist; tool-timeout reaps `&`-backgrounded processes — launch long-lived helpers via python Popen `start_new_session=True`.
 - 2026-09-11: Remaining known items: real-cloud verification needs the user's OPENROUTER_API_KEY; per-worker CPU/RSS tracking is a future enhancement; `cargo tauri dev` first build not yet run end-to-end (compiles clean).
 
 ---
@@ -211,8 +212,15 @@ On `inject: true`, `skill-injector.js` reads `skillbase/{skill}.md` (or `.json`)
 
 ## 6. Telemetry (Tauri IPC)
 
-- Rust side (`src-tauri`): spawns/watches the Node backend; emits `telemetry://metrics` events every 500 ms with `{ram_used_pct, cpu_pct, queue_depth, workers_running, workers_hibernating, governor_events_last_min}`.
-- React side: single `listen()` subscription feeding lightweight gauges; **no HTTP polling** — native IPC only, as specified.
+- Rust side (`src-tauri`): spawns/watches the Node backend; tails `database/telemetry.json` every 1 s and emits `telemetry://metrics` events (native IPC; zero network in the shell).
+- Browser fallback (plain Vite): loopback `telemetry-server.js :6292` serves the same JSON with `Cache-Control: no-store` (browsers heuristic-cache otherwise — bit us once).
+- React side: single subscription (Tauri `listen()` or HTTP poll) into a 500 ms throttled feed; gauges + **per-agent fleet table** (`pool.workers[]`: id, kind, phase, attempts, cpuPct, stateBytes, busyMs).
+- Per-agent usage semantics (workers are in-process state machines, so true per-process stats do not exist — these are the owned, honest numbers):
+  - `cpuPct` = worker's busy share of the host event loop over the interval (busyMs delta / interval; sums to ≤100%). Persisted in `workers.cpu_pct` via `governor.statsHeartbeat()` each cycle (`pool.heartbeatAll()`).
+  - `stateBytes` = **exact** `JSON.stringify(worker.state)` size — precisely what hibernation writes to `worker_states`. Persisted in `workers.state_bytes`.
+  - `busyMs` = cumulative wall time inside `step()` (persisted in `workers.busy_ms`).
+  - RSS = host Node process RSS (via `ps` on macOS, `/proc` on Linux: `governor.readProcessStats`), split evenly per live agent; shown in the table header as host rss + ~per-agent.
+- Schema note: `workers` gains `cpu_pct`/`state_bytes`/`busy_ms` (+ `idx_workers_usage`). Governor migrates existing DBs **before** applying SCHEMA — the index on `cpu_pct` forces ALTERs to run first on legacy files.
 - Numbers sourced from the governor's SQLite + OS process stats, so UI and governor can never disagree.
 
 ---

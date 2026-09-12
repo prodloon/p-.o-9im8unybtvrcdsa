@@ -38,6 +38,9 @@ class Worker {
     this.id = id;
     this.kind = kind;
     this.governor = governor;
+    // Per-agent usage accounting (surfaced in the telemetry dashboard):
+    this.busyMs = 0;        // cumulative wall time inside step() — owned signal
+    this._stepStartedAt = null;
     this.root = path.resolve(root);
     this.maxSteps = maxSteps;
     this.state = {
@@ -172,6 +175,18 @@ class Worker {
 
   /** The single transition step. Returns the worker's report for this step. */
   async step(task) {
+    const startedAt = Date.now();
+    this._stepStartedAt = startedAt;
+    try {
+      return await this._step(task);
+    } finally {
+      this.busyMs += Date.now() - startedAt; // busy time even on thrown steps
+      this._stepStartedAt = null;
+    }
+  }
+
+  /** Inner transition (wrapped by step() for busy-time accounting). */
+  async _step(task) {
     this.state.attempts += 1;
     if (this.state.attempts > this.maxSteps) {
       this.state.phase = 'failed';
@@ -204,6 +219,20 @@ class Worker {
       this.state.lastError = String(err.message);
       return { workerId: this.id, taskId: task.id, ok: false, error: String(err.message), action };
     }
+  }
+
+  /**
+   * Exact size of this worker's serialized state — the true measure of what
+   * hibernation would write to SQLite. Measured on demand (not cached),
+   * so it always reflects the current history/files arrays.
+   */
+  getUsage() {
+    return {
+      busyMs: this.busyMs,
+      stateBytes: Buffer.byteLength(JSON.stringify(this.state), 'utf8'),
+      phase: this.state.phase,
+      attempts: this.state.attempts,
+    };
   }
 }
 

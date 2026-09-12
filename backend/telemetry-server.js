@@ -36,6 +36,8 @@ function readTelemetry() {
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
+  // The payload is a live gauge — browsers must never heuristic-cache it.
+  res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'GET' || !req.url.startsWith('/api/telemetry')) {
     res.statusCode = 405;
     res.end(JSON.stringify({ error: 'GET /api/telemetry only' }));

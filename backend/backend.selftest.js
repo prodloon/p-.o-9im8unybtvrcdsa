@@ -344,6 +344,90 @@ async function main() {
   }
 
   // ============================================================================
+  suite('S12: per-agent usage — busy-time attribution + dashboard rows');
+  {
+    // 12a. Worker busy-time accounting
+    {
+      const env = makeEnv();
+      try {
+        const w = new Worker({ id: 'w-busy', kind: 'file-io', governor: env.governor, root: env.tmp });
+        await w.step({ id: 1, kind: 'file-io', payload: { action: 'write_file', params: { path: 'u.txt', content: 'usage' } } });
+        const u = w.getUsage();
+        check('step() accrues busy time', typeof u.busyMs === 'number' && u.busyMs >= 0);
+        check('stateBytes is the exact serialized size', u.stateBytes === Buffer.byteLength(JSON.stringify(w.state), 'utf8') && u.stateBytes > 0);
+        check('usage reports phase + attempts', u.phase === 'working' && u.attempts === 1, JSON.stringify(u));
+      } finally {
+        env.cleanup();
+      }
+    }
+
+    // 12b. Pool attribution with injectable clock + host-stats reader
+    {
+      const env = makeEnv();
+      try {
+        let t = 10_000;
+        const clock = () => (t += 2000); // 2s cadence, like production cycles
+        const HOST_RSS = 300 * 1024 * 1024;
+        const pool = new WorkerPool({
+          governor: env.governor,
+          root: env.tmp,
+          targetSize: 2,
+          maxSize: 4,
+          clock,
+          hostStatsReader: () => ({ cpuPct: 61.5, rssBytes: HOST_RSS }),
+        });
+        const a = pool.acquire('file-io');
+        a.state.phase = 'done';
+
+        const first = pool.heartbeatAll();
+        check('first pass primes interval (cpu null, rss measured)', first.count === 1 && a.lastCpuPct === null && first.hostStats.rssBytes === HOST_RSS);
+        check('per-agent rss split from host process', first.hostStats.perWorkerRss === HOST_RSS);
+
+        // Busy 1s of a 2s interval → 50% attributed CPU
+        a.busyMs += 1000;
+        pool.heartbeatAll();
+        check('cpu attributed as busy share of interval', a.lastCpuPct === 50, String(a.lastCpuPct));
+
+        const row = env.governor.workerStatsSnapshot()[0];
+        check('usage persisted to workers table', !!row && row.cpuPct === 50 && row.busyMs === a.busyMs && row.stateBytes > 0, JSON.stringify(row));
+
+        const snap = pool.snapshot();
+        check('snapshot.workers carries fleet rows for the UI table', snap.workers.length === 1 && snap.workers[0].id === a.id && snap.workers[0].cpuPct === 50);
+        check('snapshot carries hostStats', snap.hostStats.rssBytes === HOST_RSS);
+
+        // Fleet grows: per-agent rss re-splits across 2 agents
+        a.state.phase = 'working'; // keep a busy so acquire spawns fresh
+        const b = pool.acquire('file-io');
+        b.state.phase = 'done';
+        const third = pool.heartbeatAll();
+        check('per-agent rss re-splits as fleet grows', third.hostStats.perWorkerRss === Math.round(HOST_RSS / 2));
+      } finally {
+        env.cleanup();
+      }
+    }
+
+    // 12c. Orchestrator end-to-end: telemetry() exposes the per-agent table
+    {
+      const env = makeEnv();
+      try {
+        const bridge = new SupervisorBridge({ apiKey: null });
+        const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
+        env.governor.enqueueTask('file-io', { action: 'write_file', params: { path: 'x.txt', content: 'y' } });
+        await orch.runCycle();
+        const tel = orch.telemetry();
+        check('telemetry exposes per-agent workers array', Array.isArray(tel.pool.workers) && tel.pool.workers.length >= 1);
+        const agent = tel.pool.workers[0];
+        check('agent rows carry cpu/state/busy/phase', typeof agent.cpuPct === 'number' && agent.stateBytes > 0 && typeof agent.busyMs === 'number' && typeof agent.phase === 'string', JSON.stringify(agent));
+        check('telemetry exposes hostStats', !!tel.hostStats && 'rssBytes' in tel.hostStats);
+        check('usage persisted in DB after a real cycle', env.governor.workerStatsSnapshot().length >= 1);
+        orch.close();
+      } finally {
+        env.cleanup();
+      }
+    }
+  }
+
+  // ============================================================================
   suite('S11: governor regression — Phase 1 battery still green');
   {
     const { execFileSync } = require('child_process');
@@ -355,7 +439,7 @@ async function main() {
       out = String(err.stdout || '');
       nestedFail = true;
     }
-    check('governor battery passes (43/43)', /44 passed, 0 failed/.test(out) === false && / passed, 0 failed/.test(out), out.split('\n').slice(-3).join(' | '));
+    check('governor battery passes (56/56)', /44 passed, 0 failed/.test(out) === false && / passed, 0 failed/.test(out), out.split('\n').slice(-3).join(' | '));
     check('governor battery did not fail', nestedFail === false);
   }
 

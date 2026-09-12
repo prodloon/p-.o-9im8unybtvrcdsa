@@ -234,7 +234,7 @@ suite('S6: hibernate → wake round-trip preserves state');
 }
 
 // ============================================================================
-suite('S7: real system RAM reader sanity');
+suite('S8: real system RAM reader sanity');
 {
   const { systemRamReader } = require('./governor');
   const r = systemRamReader();
@@ -242,6 +242,60 @@ suite('S7: real system RAM reader sanity');
   check('usedBytes is a sane positive number', r.usedBytes > 0 && r.usedBytes < r.totalBytes, `${(r.usedBytes / 1024 ** 3).toFixed(2)} GiB used`);
   const pct = (r.usedBytes / r.totalBytes) * 100;
   check('computed pct in range', pct > 0 && pct < 100, `${pct.toFixed(1)}%`);
+}
+
+// ============================================================================
+suite('S9: per-worker usage — columns, migration, statsHeartbeat, proc stats');
+{
+  const t = makeGov();
+  try {
+    // Fresh DB ships with the usage columns.
+    const cols = t.gov.db.prepare('PRAGMA table_info(workers)').all().map((c) => c.name);
+    for (const want of ['cpu_pct', 'state_bytes', 'busy_ms']) {
+      check(`column ${want} exists on fresh DB`, cols.includes(want));
+    }
+
+    t.gov.registerWorker('w-u1', 'file-io');
+    check('statsHeartbeat persists usage', t.gov.statsHeartbeat('w-u1', { cpuPct: 4.5, stateBytes: 2048, busyMs: 1200 }));
+    const snap = t.gov.workerStatsSnapshot();
+    check('workerStatsSnapshot returns the row', snap.length === 1);
+    const row = snap[0];
+    check('snapshot fields round-trip', row.id === 'w-u1' && row.cpuPct === 4.5 && row.stateBytes === 2048 && row.busyMs === 1200);
+
+    // Partial update keeps stored values (COALESCE semantics).
+    t.gov.statsHeartbeat('w-u1', { busyMs: 1500 });
+    const after = t.gov.workerStatsSnapshot()[0];
+    check('partial statsHeartbeat keeps cpu/state', after.cpuPct === 4.5 && after.stateBytes === 2048);
+    check('partial statsHeartbeat updates busyMs', after.busyMs === 1500);
+
+    // Migration: simulate a pre-usage database and open it with the governor.
+    const { DatabaseSync } = require('node:sqlite');
+    const tmpOld = path.join(os.tmpdir(), `daisy-gov-mig-${process.pid}-${Math.random().toString(36).slice(2)}.sqlite`);
+    {
+      const legacy = new DatabaseSync(tmpOld);
+      legacy.exec("CREATE TABLE workers (id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('running','hibernating','zombie')), priority INTEGER NOT NULL DEFAULT 5, ram_bytes INTEGER, spawned_at INTEGER NOT NULL, last_heartbeat INTEGER NOT NULL)");
+      legacy.prepare("INSERT INTO workers (id, kind, state, priority, ram_bytes, spawned_at, last_heartbeat) VALUES ('w-old', 'file-io', 'running', 5, 1024, 1, 2)").run();
+      legacy.close();
+    }
+    const mig = new Governor({ dbPath: tmpOld, ramReader: t.gov.ramReader, clock: t.clock, silent: true });
+    const oldRow = mig.db.prepare("SELECT id, cpu_pct, busy_ms FROM workers WHERE id='w-old'").get();
+    check('existing DB migrates in place, data preserved', !!oldRow && oldRow.id === 'w-old' && oldRow.cpu_pct === null && oldRow.busy_ms === 0);
+    check('migrated governor accepts statsHeartbeat', mig.statsHeartbeat('w-old', { cpuPct: 3.3, stateBytes: 512, busyMs: 250 }));
+    mig.close();
+    fs.rmSync(tmpOld, { force: true });
+    fs.rmSync(`${tmpOld}-wal`, { force: true });
+    fs.rmSync(`${tmpOld}-shm`, { force: true });
+
+    // Real process-stats reader on this very process.
+    const { readProcessStats } = require('./governor');
+    const me = readProcessStats(process.pid);
+    check('readProcessStats(self) returns rss', Number.isFinite(me.rssBytes) && me.rssBytes > 1_000_000, me.rssBytes ? `${(me.rssBytes / 1024 ** 2).toFixed(1)} MB` : 'null');
+    check('readProcessStats returns cpu% on darwin', process.platform !== 'darwin' || (Number.isFinite(me.cpuPct) && me.cpuPct >= 0), String(me.cpuPct));
+    const ghost = readProcessStats(9_999_999);
+    check('readProcessStats on dead pid → nulls', ghost.cpuPct === null && ghost.rssBytes === null);
+  } finally {
+    t.cleanup();
+  }
 }
 
 // ============================================================================
