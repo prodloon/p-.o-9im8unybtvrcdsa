@@ -19,7 +19,11 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const TELEMETRY_FILE = path.join(__dirname, '..', 'database', 'telemetry.json');
+// Same override as the orchestrator — installed-app mode redirects data dir.
+const TELEMETRY_FILE = path.join(
+  process.env.DAISY_DATA_DIR || path.join(__dirname, '..', 'database'),
+  'telemetry.json'
+);
 const PORT = (() => {
   const i = process.argv.indexOf('--port');
   return i > -1 ? Number(process.argv[i + 1]) || 6292 : 6292;

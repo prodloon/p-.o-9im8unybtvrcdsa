@@ -38,7 +38,10 @@ const POLL_INTERVAL_MS = 2_000; // production poll cadence
 
 // --- Defaults ---------------------------------------------------------------
 const DEFAULT_TOTAL_RAM = 16 * 1024 * 1024 * 1024; // 16 GiB; overridable
-const DEFAULT_DB_PATH = path.join(__dirname, '..', 'database', 'agent-states.sqlite');
+// Data dir override for installed-app operation (bundle is read-only in
+// /Applications): the shell sets DAISY_DATA_DIR to an Application Support dir.
+const DATA_DIR = process.env.DAISY_DATA_DIR || path.join(__dirname, '..', 'database');
+const DEFAULT_DB_PATH = path.join(DATA_DIR, 'agent-states.sqlite');
 
 /**
  * Read CPU% and RSS of one process without npm deps.

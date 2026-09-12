@@ -45,10 +45,24 @@ warn() { printf "  %s!%s %s\n" "$c_amber" "$c_off" "$1"; }
 note() { printf "  %s%s%s\n" "$c_dim" "$1" "$c_off"; }
 
 # --- service discovery (pgrep by command shape; ports as fallback) ----------
-orch_pid()     { pgrep -f "node .*backend/index[.]js --serve" | head -1; }
+# NOTE: excludes the INSTALLED app's backend (Daisy Cluster.app/.../appdata)
+# — clusterctl manages the repo stack only; the installed .app owns its own.
+orch_pid() {
+  local p cmd
+  for p in $(pgrep -f "node .*backend/index[.]js --serve"); do
+    cmd="$(ps -o command= -p "$p" 2>/dev/null)"
+    case "$cmd" in *"Daisy Cluster.app"*) ;; *) echo "$p"; return ;; esac
+  done
+}
 telemetry_pid(){ pgrep -f "backend/telemetry-server[.]js" | head -1; }
 vite_pid()     { lsof -ti tcp:"$UI_PORT" 2>/dev/null | head -1; }
-shell_pid()    { pgrep -x "daisy-cluster" | head -1; }
+shell_pid()    {
+  local p
+  for p in $(pgrep -x "daisy-cluster"); do
+    case "$(ps -o command= -p "$p" 2>/dev/null)" in *"Daisy Cluster.app"*) ;; *) echo "$p"; return ;; esac
+  done
+}
+installed_shell_pid() { pgrep -x "daisy-cluster" | while read -r p; do case "$(ps -o command= -p "$p" 2>/dev/null)" in *"Daisy Cluster.app"*) echo "$p";; esac; done | head -1; }
 alive()        { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
 shell_is_up() { alive "$(shell_pid)"; }
@@ -208,9 +222,21 @@ cmd_status() {
   }
   check orchestrator "$o" orch_healthy
   check telemetry-server "$t" curl -sf -m 2 "http://127.0.0.1:$TELEMETRY_PORT/api/telemetry"
-  check dashboard-vite "$v" curl -sf -m 2 "http://localhost:$UI_PORT/"
+  # Dashboard is a VIEWER, not core — it never gates the exit code (it may be
+  # intentionally absent via --no-ui, or replaced by the installed app's window).
+  if alive "$v"; then
+    if curl -sf -m 2 "http://localhost:$UI_PORT/" >/dev/null 2>&1; then printf "  %-18s %-8s %s✓ up%s → http://localhost:%s\n" "dashboard-vite" "$v" "$c_green" "$c_off" "$UI_PORT"
+    else printf "  %-18s %-8s %s! pid alive, probe failed%s\n" "dashboard-vite" "$v" "$c_amber" "$c_off"; fi
+  else
+    printf "  %-18s %-8s %s— not running (optional; ./clusterctl.sh start)%s\n" "dashboard-vite" "-" "$c_dim" "$c_off"
+  fi
   if alive "$s"; then printf "  %-18s %-8s %s✓ up%s\n" "shell" "$s" "$c_green" "$c_off"
   else printf "  %-18s %-8s %s— not running%s\n" "shell" "-" "$c_dim" "$c_off"; fi
+  local inst
+  inst=$(installed_shell_pid)
+  if alive "$inst"; then
+    note "installed app: /Applications/Daisy Cluster.app running (pid $inst) — owns its own backend"
+  fi
 
   # live telemetry glance
   local tel

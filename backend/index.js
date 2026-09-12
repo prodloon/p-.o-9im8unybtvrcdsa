@@ -37,7 +37,10 @@ const ORCH_POLICY = {
   SKILLS_CATALOG_CACHE_MS: 5000,
   TELEMETRY_WRITE_MS: 1000, // telemetry.json refresh for the UI
 };
-const TELEMETRY_FILE = path.join(__dirname, '..', 'database', 'telemetry.json');
+// Data dir override for installed-app operation (the .app bundle in
+// /Applications is read-only) — falls back to the repo database/ dir.
+const DATA_DIR = process.env.DAISY_DATA_DIR || path.join(__dirname, '..', 'database');
+const TELEMETRY_FILE = path.join(DATA_DIR, 'telemetry.json');
 
 class Orchestrator {
   constructor(opts = {}) {
@@ -55,7 +58,7 @@ class Orchestrator {
     // host process stats (RSS/CPU of this Node process) for per-agent telemetry.
     this.pool = new WorkerPool({
       governor: this.governor,
-      root: opts.sandboxRoot || path.join(this.root, 'daisy_sandbox_cluster'),
+      root: opts.sandboxRoot || process.env.DAISY_SANDBOX_DIR || path.join(this.root, 'daisy_sandbox_cluster'),
       targetSize: opts.targetSize || 8,
       clock: this.governor.clock,
       hostStatsReader: () => readProcessStats(process.pid),

@@ -132,7 +132,34 @@ node backend/backend.selftest.js       # 61 checks
 All three green = launch-ready. The Python battery also asserts the legacy
 `daisy_*.py` files remain untouched.
 
-## 7. Known constraints
+## 7. Release app (installed .app)
+
+The desktop shell ships as a normal macOS app:
+
+```bash
+./make-installer.sh               # tauri build + stage payload + install to /Applications
+./make-installer.sh --skip        # restage payload + reinstall (no cargo rebuild)
+open '/Applications/Daisy Cluster.app'
+```
+
+Layout:
+- **Code:** the bundle carries `backend/`, `governor/`, `skillbase/` in
+  `Contents/Resources/appdata/` (no secrets, no node_modules, no state).
+- **State:** `~/Library/Application Support/DaisyCluster/{database,sandbox}/`
+  (the shell sets `DAISY_DATA_DIR`/`DAISY_SANDBOX_DIR` automatically — the
+  bundle is read-only in /Applications).
+- **Secrets:** `~/Library/Application Support/DaisyCluster/.env` — put
+  `OPENROUTER_API_KEY=…` there; the shell loads it at backend spawn.
+- **A DMG** for sharing lands in `src-tauri/target/release/bundle/dmg/`.
+
+The installed app and the repo stack are INDEPENDENT (separate data dirs,
+separate queues). `clusterctl` manages the repo stack only and shows the
+installed app's presence informationally.
+
+Rebuild after backend/governor changes: `./make-installer.sh` (full) —
+the payload is re-staged automatically.
+
+## 8. Known constraints
 
 - 16 GiB ceiling: hibernation ≥80%, spawn block ≥90% (policy in
   `governor/governor.js`; contract in `knowledge.md §4`).
