@@ -514,6 +514,37 @@ async function main() {
   }
 
   // ============================================================================
+  suite('S15: cost rollup — $ avoided computed from skill_events');
+  {
+    // Unit price: exactly the measured rate card (286 prompt + 40 completion).
+    const { SupervisorBridge: SB } = require('./supervisor-bridge.js');
+    const unit = (POLICY.TIER3_EST_PROMPT_TOKENS / 1e6) * POLICY.TIER3_PROMPT_USD_PER_MTOK + (POLICY.TIER3_EST_COMPLETION_TOKENS / 1e6) * POLICY.TIER3_COMPLETION_USD_PER_MTOK;
+    check('unit consult price matches rate card ($0.000972 measured)', Math.abs(unit - 0.000972) < 1e-9, String(unit));
+
+    const env = makeEnv();
+    try {
+      const bridge = new SupervisorBridge({ apiKey: null });
+      const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
+      check('bridge tier3ConsultCostUsd() agrees with POLICY math', Math.abs(bridge.tier3ConsultCostUsd() - unit) < 1e-9);
+
+      // One real (offline) cycle: obvious match → tier-1 consult + injection.
+      env.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'scaffold a new express api for users' });
+      await orch.runCycle();
+      const roll = orch.costRollup();
+      const r4 = Math.round(unit * 10000) / 10000;
+      check('tier-1 consult counted and avoided at unit price', roll.perTier['tier1-template'].consults === 1 && roll.perTier['tier1-template'].costUsd === 0 && Math.abs(roll.perTier['tier1-template'].avoidedUsd - r4) < 1e-9, JSON.stringify(roll.perTier));
+      check('keyless run spends nothing at T3', roll.totals.spentUsd === 0 && roll.perTier.supervisor.consults === 0);
+      check('totals: avoided == avoidedUnits × unit, savings % sane', Math.abs(roll.totals.avoidedUsd - r4) < 1e-9 && roll.totals.consults === 1 && roll.totals.savingsPct === 100, JSON.stringify(roll.totals));
+
+      const tel = orch.telemetry();
+      check('telemetry carries the costs block for the dashboard', tel.costs && typeof tel.costs.unitT3Usd === 'number' && !!tel.costs.method && tel.costs.totals.consults >= 1);
+      orch.close();
+    } finally {
+      env.cleanup();
+    }
+  }
+
+  // ============================================================================
   suite('S11: governor regression — Phase 1 battery still green');
   {
     const { execFileSync } = require('child_process');

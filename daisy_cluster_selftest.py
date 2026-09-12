@@ -67,7 +67,7 @@ def suite_backend_battery():
     print("== SUITE 2: BACKEND BATTERY (node) ==")
     code, out, _err = run_node("backend/backend.selftest.js")
     check("backend", "battery exits 0", code == 0)
-    check("backend", "78/78 checks pass", "78 passed, 0 failed" in out)
+    check("backend", "84/84 checks pass", "84 passed, 0 failed" in out)
     check("backend", "covers SNIPE gate",
           any("SNIPE" in line for line in out.splitlines()))
     check("backend", "covers permanent model mappings",
@@ -160,6 +160,13 @@ def suite_telemetry():
                 check("telemetry", f"key '{key}' present", key in tele)
             check("telemetry", "ramPct sane", isinstance(tele.get("ramPct"), (int, float))
                   and 0 <= tele["ramPct"] <= 100)
+            # Cost rollup (dashboard cost lines source):
+            costs = tele.get("costs") or {}
+            check("telemetry", "costs rollup present with totals", 
+                  {"unitT3Usd", "perTier", "totals", "method"} <= set(costs)
+                  and {"spentUsd", "avoidedUsd", "consults", "savingsPct"} <= set(costs.get("totals", {})))
+            check("telemetry", "cost unit is the measured T3 price", 
+                  abs(costs.get("unitT3Usd", -1) - 0.001) < 5e-4)
             check("telemetry", "pool snapshot shape",
                   {"size", "targetSize", "spawnBlocked", "byPhase", "workers"} <= set(tele.get("pool", {})))
             # Per-agent usage rows (the dashboard's fleet table source):

@@ -47,6 +47,15 @@ const POLICY = {
   OLLAMA_MAX_TOKENS: 220,
   // Tier 3: frontier brain via OpenRouter — exclusive, no cloud fallback
   TIER3_MODEL: '~anthropic/claude-sonnet-latest', // PINNED — live-verified alias, no env override
+  // --- Rate card for the cost rollup (measured live 2026-09-12) -----------
+  // Pinned T3 list price: $2/M prompt, $10/M completion (OpenRouter catalog).
+  // One real consult measured 286 prompt + 40 completion tokens →
+  // $0.000972 (OpenRouter's own usage.cost matched to the digit). T1/T2
+  // are $0 by law, so $ avoided per consult = TIER3_COST_PER_CONSULT_USD.
+  TIER3_PROMPT_USD_PER_MTOK: 2,
+  TIER3_COMPLETION_USD_PER_MTOK: 10,
+  TIER3_EST_PROMPT_TOKENS: 286,
+  TIER3_EST_COMPLETION_TOKENS: 40,
   ENDPOINT: 'https://openrouter.ai/api/v1/chat/completions',
   MAX_ATTEMPTS_PER_MODEL: 3,
   BASE_BACKOFF_MS: 500,
@@ -291,6 +300,17 @@ class SupervisorBridge {
       attempts: res.attempts || 0,
       latencyMs: this.clock() - t0,
     };
+  }
+
+  /**
+   * Modeled cost of ONE tier-3 consult at the pinned rate card (USD).
+   * Calibration measured live: 286 prompt + 40 completion tokens →
+   * $0.000972, matching OpenRouter's own usage.cost to the digit.
+   */
+  tier3ConsultCostUsd() {
+    const prompt = (POLICY.TIER3_EST_PROMPT_TOKENS / 1e6) * POLICY.TIER3_PROMPT_USD_PER_MTOK;
+    const completion = (POLICY.TIER3_EST_COMPLETION_TOKENS / 1e6) * POLICY.TIER3_COMPLETION_USD_PER_MTOK;
+    return prompt + completion;
   }
 
   /** Ask the Supervisor for a verdict on a worker task. */

@@ -107,6 +107,13 @@ LaunchAgent/cron-driven operation without a resident process.
   - `task_queue` — full task history with attempts and outcomes
   - `workers.cpu_pct / state_bytes / busy_ms` — per-agent usage history
 
+- **Cost rollup:** `telemetry.json → costs` (and the dashboard's
+  Supervisor-pipeline panel) shows all-time $ spent at T3 vs $ avoided by
+  handling consults at T1/T2/fallback. Computed from `skill_events` × the
+  measured T3 consult price ($0.000972: 286 prompt + 40 completion tokens
+  at the pinned $2/$10-per-Mtok rate card, live-calibrated). Modeled, not
+  invoiced — `method` in the block states the basis.
+
 ### 4.1 The 3-Tier cascade (what handled each task, and what it cost)
 
 Every supervisor consult descends **T1 local templates ($0) → T2 Ollama

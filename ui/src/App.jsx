@@ -121,11 +121,12 @@ const AgentTable = React.memo(function AgentTable({ workers, hostStats, perWorke
   );
 });
 
-/** 3-Tier cascade pipeline: per-cycle tier distribution + model pins + last route. */
-function CascadePanel({ cascade }) {
+/** 3-Tier cascade pipeline: per-cycle tier distribution + model pins + last route + cost rollup. */
+function CascadePanel({ cascade, costs }) {
   const tiers = cascade?.tiers || {};
   const last = cascade?.lastTier;
   const total = Object.values(tiers).reduce((a, v) => a + (v || 0), 0);
+  const fmtUsd = (v) => (v == null ? '—' : v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`);
   const rows = [
     { key: 'tier1-template', label: 'T1 · skill templates', model: 'skillbase (local)', tone: 'bg-emerald-500' },
     { key: 'tier2-local', label: 'T2 · local LLM', model: cascade?.models?.tier2 || 'ollama', tone: 'bg-sky-500' },
@@ -156,6 +157,18 @@ function CascadePanel({ cascade }) {
       <div className="mt-2 text-[10px] text-slate-600">
         last route: {last ? `${last.source} (${last.model ?? '?'}) in ${last.latencyMs ?? 0}ms` : 'none yet'}
       </div>
+      {costs?.totals && (
+        <div className="mt-2 border-t border-slate-700/60 pt-2">
+          <div className="flex items-baseline justify-between text-xs">
+            <span className="text-xs font-medium uppercase tracking-wider text-slate-400">Cost rollup (all time)</span>
+            <span className="font-mono text-emerald-400">{costs.totals.savingsPct}% avoided</span>
+          </div>
+          <div className="mt-1 space-y-0.5 text-[11px] text-slate-400">
+            <div className="flex justify-between"><span>avoided by T1/T2/fallback ({costs.totals.consults - (costs.perTier?.supervisor?.consults ?? 0)} consults)</span><span className="font-mono text-emerald-400">{fmtUsd(costs.totals.avoidedUsd)}</span></div>
+            <div className="flex justify-between"><span>spent at T3 ({costs.perTier?.supervisor?.consults ?? 0} consults × {fmtUsd(costs.unitT3Usd)})</span><span className="font-mono text-slate-300">{fmtUsd(costs.totals.spentUsd)}</span></div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -248,7 +261,7 @@ export default function App() {
             <div className="flex justify-between"><span>Hibernating workers</span><span className="font-mono">{sample?.workersHibernating ?? 0}</span></div>
           </div>
         </div>
-        <CascadePanel cascade={sample?.cascade} />
+        <CascadePanel cascade={sample?.cascade} costs={sample?.costs} />
       </div>
 
       <div className="mt-4">

@@ -275,8 +275,51 @@ class Orchestrator {
           tier3: this.bridge.modelChain[0],
         },
       },
+      // Cost rollup (dashboard: $ avoided by handling consults at T1/T2).
+      // T1/T2 are $0 by the COST LAW; the avoided spend is the modeled
+      // T3 consult price × count of consults handled below the frontier
+      // tier. Computed from skill_events (the permanent audit trail), so
+      // the number survives restarts and agrees with the DB.
+      costs: this.costRollup(),
       workersHibernating: this.governor.db.prepare("SELECT COUNT(*) n FROM workers WHERE state='hibernating'").get().n,
     };
+  }
+
+  /**
+   * Per-tier cost accounting from skill_events (audit trail = source of
+   * truth). Tier-3 consults count ONLY successful ones (source='supervisor'
+   * — a consulted-but-declined route still cost money in reality, but the
+   * audit trail cannot distinguish it; counting it would overstate T3
+   * spend, so we under-count and stay honest about the method).
+   */
+  costRollup() {
+    const unit = this.bridge.tier3ConsultCostUsd();
+    const rows = this.governor.db
+      .prepare('SELECT source, COUNT(*) AS n FROM skill_events GROUP BY source')
+      .all()
+      .reduce((acc, r) => ((acc[r.source] = r.n), acc), {});
+    const t1 = rows['tier1-template'] || 0;
+    const t2 = rows['tier2-local'] || 0;
+    const fb = rows['local-fallback'] || 0;
+    const t3 = rows.supervisor || 0;
+    const avoided = t1 + t2 + fb;
+    const round4 = (x) => Math.round(x * 10000) / 10000;
+    return {
+      unitT3Usd: round4(unit),
+      perTier: {
+        'tier1-template': { consults: t1, costUsd: 0, avoidedUsd: round4(t1 * unit) },
+        'tier2-local': { consults: t2, costUsd: 0, avoidedUsd: round4(t2 * unit) },
+        supervisor: { consults: t3, costUsd: round4(t3 * unit), avoidedUsd: 0 },
+        'local-fallback': { consults: fb, costUsd: 0, avoidedUsd: round4(fb * unit) },
+      },
+      totals: {
+        spentUsd: round4(t3 * unit),
+        avoidedUsd: round4(avoided * unit),
+        consults: t1 + t2 + fb + t3,
+        savingsPct: t1 + t2 + fb + t3 > 0 ? Math.round((avoided / (t1 + t2 + fb + t3)) * 1000) / 10 : 0,
+      },
+      method: 'modeled: T1/T2 $0 by COST LAW; $ avoided = below-frontier consults × measured T3 consult price ($0.000972, live-calibrated 2026-09-12)',
+    }; 
   }
 
   /** Atomically persist telemetry for the Tauri shell / UI (tmp+rename). */
