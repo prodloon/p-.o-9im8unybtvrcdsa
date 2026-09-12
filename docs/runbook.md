@@ -102,9 +102,34 @@ LaunchAgent/cron-driven operation without a resident process.
   to `worker_states`.
 - **Audit trail:** `database/agent-states.sqlite`
   - `governor_log` — hibernations, reaps, spawn blocks, lease requeues
-  - `skill_events` — every skill injection (source: supervisor / local-fallback)
+  - `skill_events` — every skill injection (**source = winning cascade tier**:
+    `tier1-template` / `tier2-local` / `supervisor` / `local-fallback`)
   - `task_queue` — full task history with attempts and outcomes
   - `workers.cpu_pct / state_bytes / busy_ms` — per-agent usage history
+
+### 4.1 The 3-Tier cascade (what handled each task, and what it cost)
+
+Every supervisor consult descends **T1 local templates ($0) → T2 Ollama
+qwen2.5:7b ($0) → T3 OpenRouter `~anthropic/claude-sonnet-latest`** (full
+retry/backoff chain). The orchestrator log prints the route per task
+(`task 27 → tier2-local (qwen2.5:7b) in 22897ms`) and per-cycle tier totals;
+`telemetry.json → cascade` carries live per-tier counts, the pinned model
+strings, and the last route for the dashboard's **Supervisor pipeline** panel.
+
+Live-routing cheat sheet (all three verified in production):
+
+| You will see | Meaning | Cost |
+|---|---|---|
+| `→ tier1-template (skillbase-templates) in 1ms` | trigger match sniped locally | $0 |
+| `→ tier2-local (qwen2.5:7b) in ~20-30s` | local LLM triaged it (cold start can push past 100s) | $0 |
+| `→ supervisor (~anthropic/claude-sonnet-latest) in ~2-3s` | frontier brain consulted | tokens |
+| `→ supervisor` + `no skill found` | T3 consulted and honestly declined (no skill fits) | tokens |
+| `fallback=1` | everything above declined; keyword snipe caught it | $0 |
+
+Tier-2/3 behavior is tunable via env: `DAISY_TIER2_MODEL` (set it to a bogus
+name to force T3 — useful for tests), `DAISY_OLLAMA_URL`,
+`DAISY_OLLAMA_TIMEOUT_MS` (default 120 s), `DAISY_TIER3_MODEL`. The full
+contract lives in `knowledge.md` §5.5 — the COST LAW.
 - **Quick introspection:**
   ```bash
   node -e "const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync('database/agent-states.sqlite');console.table(db.prepare('SELECT event,COUNT(*) n FROM governor_log GROUP BY event').all())"

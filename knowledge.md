@@ -19,6 +19,7 @@
 - 2026-09-11: `clusterctl.sh` — single control surface (start [--shell] [--no-ui] / stop / status / restart / logs / task). Adoption by discovery (pgrep command shapes + port fallback), not pidfile-dependence — it adopted the hand-started stack on first run. Shell-mode mutual exclusion: the Tauri shell owns its backend; headless start refuses next to it; stop kills the shell LAST. Children spawn via python `Popen(start_new_session=True)` (macOS has NO setsid binary — nohup+& children get reaped by tool-timeout process groups; this is the only reliable detach on this box). Orchestrator health = telemetry.json mtime <10s (NOT the telemetry-server URL, which is a different process). status exit code is machine-readable (0 all green / 1 partial-down). logs/ and .run/ are gitignored. Battery gains SUITE 7 (control script) — run it with the stack up for full coverage.
 - 2026-09-11: RELEASE .app shipped. `make-installer.sh` = reproducible pipeline (tauri build → stage appdata payload → swap hardened binary → ad-hoc sign → ditto to /Applications; `--skip` re-stages without rebuilding). Installed layout: code in `Contents/Resources/appdata/` (NO secrets/node_modules/state), runtime data in `~/Library/Application Support/DaisyCluster/{database,sandbox}` via new `DAISY_DATA_DIR`/`DAISY_SANDBOX_DIR` env overrides (governor DB path, telemetry file, sandbox root all honor them; defaults unchanged), secrets in `<appdata>/.env` loaded by the shell. Rust hardening: root discovery probes the BUNDLE first (compile-time CARGO_MANIFEST_DIR is baked in and exists on the build machine — first release launch ran the repo backend because dev-tree won; fixed by ordering), single-instance plugin, `.env` fills gaps only (real exports win). clusterctl now EXCLUDES the installed app's processes (shell+orchestrator cross-matched by command shape; status shows the installed app informationally). Dashboard demoted to non-gating in status (viewer, not core). Battery 53/53 with BOTH stacks coexisting. DMG at src-tauri/target/release/bundle/dmg/.
 - 2026-09-11: Remaining known items: real-cloud verification needs the user's OPENROUTER_API_KEY; per-worker CPU/RSS tracking is a future enhancement; `cargo tauri dev` first build not yet run end-to-end (compiles clean).
+- 2026-09-11: 3-TIER MODEL CASCADE shipped (see §5.5 COST LAW — binding). User directives: Tier 3 = `anthropic/claude-sonnet-latest` — bare slug rejected HTTP 400 by OpenRouter; the live alias is the tilde form `~anthropic/claude-sonnet-latest` (HTTP 200, real verdicts served). Tier 2 = local Ollama `qwen2.5:7b` (already pulled on this box; ~17 s warm, cold start can exceed 120 s — T2 timeout sized accordingly). Gatekeeper `SupervisorBridge.routeTask()` intercepts ALL consults: T1 skillbase templates ($0) → T2 Ollama triage ($0) → T3 OpenRouter chain with backoff; `getVerdict()` only reachable via T3. Orchestrator counts per tier (`stats.tiers`, `telemetry.json → cascade{tiers,lastTier,models}`, `skill_events.source` = winning tier); dashboard gains the "Supervisor pipeline" panel. Backend battery 64/64 incl. the T1→T2→T3 escalation proof (S9) and the all-tiers-decline ⇒ no force-feed check (S7).
 
 ---
 
@@ -213,11 +214,30 @@ On `inject: true`, `skill-injector.js` reads `skillbase/{skill}.md` (or `.json`)
 
 ---
 
+## 5.5 3-Tier Model Cascading Pipeline — COST LAW (binding for all sub-agents)
+
+**The law:** every supervisor consult descends the cascade in strict cost order — never pay cloud tokens for a decision a cheaper tier can make. Implemented in `SupervisorBridge.routeTask()` (the interception gatekeeper; `consultSupervisor()` in `backend/index.js` routes through it — nothing calls `getVerdict()` except Tier 3 internally).
+
+| Tier | Handles | Engine | Cost |
+|---|---|---|---|
+| **1 — Local skill-sniping** | Routine formatting, pattern matching, rule checks, obvious skill matches | `skillbase/` trigger templates via `routeTier1()` (trigger match on the task summary) | $0 |
+| **2 — Ultra-cheap triage** | Mid-level data triage, text processing when no template matched | Local **Ollama `qwen2.5:7b`** at `http://127.0.0.1:11434` | $0, local GPU |
+| **3 — Frontier brain** | Exclusively high-complexity architecture, deep reasoning, everything T1/T2 declined | OpenRouter chain: `~anthropic/claude-sonnet-latest` → `meta-llama/llama-3.3-70b-instruct` (429/5xx exponential backoff, Retry-After honored) | cloud tokens |
+
+Rules every sub-agent must respect:
+1. **Order is fixed: T1 → T2 → T3.** A new feature that "just calls the cloud" violates this law — route through `routeTask()`.
+2. **Env overrides:** `DAISY_TIER2_MODEL`, `DAISY_OLLAMA_URL`, `DAISY_OLLAMA_TIMEOUT_MS` (default 120 s — Ollama cold start on a loaded 16 GB box is real), `DAISY_TIER3_MODEL`.
+3. **Model-string law:** bare `anthropic/...` slugs are rejected by OpenRouter (400); the live alias form is **tilde-prefixed** (`~anthropic/claude-sonnet-latest`, verified HTTP 200). NEVER pin a model slug without live-probing the OpenRouter catalog first — the 3.5-sonnet pin rotted silently for a session while the fallback masked it.
+4. **Telemetry contract:** `routeTask()` → `{source, model, verdict, attempts?, latencyMs}`, `source ∈ tier1-template | tier2-local | supervisor | cloud-unavailable`. Orchestrator counts per-source into `stats.tiers` → `telemetry.json → cascade{tiers, lastTier, models}` → dashboard "Supervisor pipeline" panel. `skill_events.source` records the winning tier (`tier1-template`/`tier2-local`/`supervisor`/`local-fallback`).
+5. **Failure semantics:** if all tiers decline (offline + unmatched task), nothing is force-fed — the task burns its attempts and fails permanently via the poison guard. No skill injection without a verdict.
+
+---
+
 ## 6. Telemetry (Tauri IPC)
 
 - Rust side (`src-tauri`): spawns/watches the Node backend; tails `database/telemetry.json` every 1 s and emits `telemetry://metrics` events (native IPC; zero network in the shell).
 - Browser fallback (plain Vite): loopback `telemetry-server.js :6292` serves the same JSON with `Cache-Control: no-store` (browsers heuristic-cache otherwise — bit us once).
-- React side: single subscription (Tauri `listen()` or HTTP poll) into a 500 ms throttled feed; gauges + **per-agent fleet table** (`pool.workers[]`: id, kind, phase, attempts, cpuPct, stateBytes, busyMs).
+- React side: single subscription (Tauri `listen()` or HTTP poll) into a 500 ms throttled feed; gauges + **per-agent fleet table** (`pool.workers[]`: id, kind, phase, attempts, cpuPct, stateBytes, busyMs) + **Supervisor pipeline panel** (`cascade`: per-tier consult counts, model pins, last route + latency).
 - Per-agent usage semantics (workers are in-process state machines, so true per-process stats do not exist — these are the owned, honest numbers):
   - `cpuPct` = worker's busy share of the host event loop over the interval (busyMs delta / interval; sums to ≤100%). Persisted in `workers.cpu_pct` via `governor.statsHeartbeat()` each cycle (`pool.heartbeatAll()`).
   - `stateBytes` = **exact** `JSON.stringify(worker.state)` size — precisely what hibernation writes to `worker_states`. Persisted in `workers.state_bytes`.

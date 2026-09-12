@@ -69,6 +69,9 @@ class Orchestrator {
     });
     this._catalogCache = { at: 0, names: null };
     this._cycle = 0;
+    // 3-Tier cascade accounting (telemetry + dashboard pipeline panel)
+    this._tiers = { 'tier1-template': 0, 'tier2-local': 0, supervisor: 0, 'local-fallback': 0 };
+    this._lastTier = null;
   }
 
   _catalog() {
@@ -88,7 +91,12 @@ class Orchestrator {
     return this.governor.enqueueTask(kind, payload);
   }
 
-  /** Attempt one cognitive consult: cloud verdict, else local snipe. */
+  /**
+   * One cognitive consult through the 3-Tier CASCADE (knowledge.md §9):
+   *   T1 local skillbase templates → T2 local Ollama triage → T3 cloud brain,
+   * with the offline keyword snipe as the final safety net. Tier provenance
+   * is recorded in skill_events and accumulated into cycle stats for telemetry.
+   */
   async consultSupervisor(worker, task) {
     const summary = String((task.payload && (task.payload.summary || task.payload.action)) || task.kind);
     const payload = this.bridge.buildRequestPayload({
@@ -98,27 +106,38 @@ class Orchestrator {
       contextDigest: { historyLen: worker.state.history.length, filesTouched: worker.state.filesWritten.length, poolSize: this.pool.size() },
       skillsCatalog: this._catalog(),
     });
-    let verdict = null;
-    let cloudOk = false;
+
+    let routed = null;
     try {
-      const res = await this.bridge.getVerdict(payload);
-      if (res.ok) {
-        verdict = res.verdict;
-        cloudOk = true;
-      } else if (this.verbose) {
-        console.log(`[orch] cloud unavailable (${res.error}) — local sniping`);
-      }
+      routed = await this.bridge.routeTask(payload, this.injector.catalogWithTriggers());
     } catch (err) {
-      if (this.verbose) console.log(`[orch] cloud error (${String(err.message)}) — local sniping`);
+      if (this.verbose) console.log(`[orch] cascade error (${String(err.message)}) — local sniping`);
+      routed = null;
     }
 
-    if (cloudOk && verdict) {
-      const outcome = this.injector.applyVerdict(verdict, worker.id, task.id);
-      if (outcome.injected) return outcome;
-      // Supervisor answered but no injection — fall through to local snipe
-      if (this.verbose) console.log(`[orch] supervisor declined injection (${outcome.reason})`);
+    if (routed && routed.verdict) {
+      const src = routed.source === 'tier1-template' ? 'tier1-template'
+        : routed.source === 'tier2-local' ? 'tier2-local'
+        : 'supervisor';
+      const outcome = this.injector.applyVerdict(routed.verdict, worker.id, task.id, src);
+      if (outcome.injected) {
+        this._tiers[src] = (this._tiers[src] || 0) + 1;
+        this._lastTier = { source: src, model: routed.model, latencyMs: routed.latencyMs };
+        if (this.verbose) console.log(`[orch] task ${task.id} → ${src} (${routed.model}) in ${routed.latencyMs}ms`);
+        return outcome;
+      }
+      if (this.verbose) console.log(`[orch] ${src} declined injection (${outcome.reason}) — local sniping`);
+    } else if (routed && routed.error && this.verbose) {
+      console.log(`[orch] cloud unavailable (${routed.error}) — local sniping`);
     }
-    return this.injector.snipeLocally(summary, worker.id, task.id);
+
+    // Final safety net: offline keyword snipe (never dead).
+    const out = this.injector.snipeLocally(summary, worker.id, task.id);
+    if (out.injected) {
+      this._tiers['local-fallback'] = (this._tiers['local-fallback'] || 0) + 1;
+      this._lastTier = { source: 'local-fallback', model: 'keyword-triggers', latencyMs: 0 };
+    }
+    return out;
   }
 
   /**
@@ -130,7 +149,12 @@ class Orchestrator {
     this.governor.heartbeat('orchestrator'); // keep our own row fresh
     const gov = this.governor.tick(); // watchdog: hysteresis, spawn block, reapers
     this.pool.heartbeatAll(); // per-agent CPU/state accounting (dashboard fleet table)
-    const stats = { cycle: this._cycle, ramPct: gov.pct, hibernated: gov.hibernated, tasksDone: 0, tasksFailed: 0, sniped: 0, cloud: 0, local: 0 };
+    this._tiers = { 'tier1-template': 0, 'tier2-local': 0, supervisor: 0, 'local-fallback': 0 }; // per-cycle tier mix
+    const stats = {
+      cycle: this._cycle, ramPct: gov.pct, hibernated: gov.hibernated,
+      tasksDone: 0, tasksFailed: 0, sniped: 0, cloud: 0, local: 0,
+      tiers: this._tiers, lastTier: null,
+    };
 
     if (this.governor.isSpawnBlocked() && this.verbose) {
       console.log(`[orch] spawn block active at ${gov.pct}% — draining queue carefully`);
@@ -198,9 +222,11 @@ class Orchestrator {
 
     this.pool.heartbeatAll(); // end-of-cycle pass: workers spawned mid-cycle get usage rows too
 
+    stats.lastTier = this._lastTier; // which tier handled the last consult
     if (this.verbose) {
+      const t = stats.tiers;
       console.log(
-        `[orch] cycle ${stats.cycle}: ram=${stats.ramPct}% tasks=${stats.tasksDone}✓/${stats.tasksFailed}✗ skills=${stats.sniped} (cloud=${stats.cloud}, local=${stats.local})`
+        `[orch] cycle ${stats.cycle}: ram=${stats.ramPct}% tasks=${stats.tasksDone}✓/${stats.tasksFailed}✗ tiers t1=${t['tier1-template']} t2=${t['tier2-local']} t3=${t.supervisor} fallback=${t['local-fallback']}`
       );
     }
     return stats;
@@ -239,6 +265,15 @@ class Orchestrator {
         leased: this.governor.db.prepare("SELECT COUNT(*) n FROM task_queue WHERE status='leased'").get().n,
         done: this.governor.db.prepare("SELECT COUNT(*) n FROM task_queue WHERE status='done'").get().n,
         failed: this.governor.db.prepare("SELECT COUNT(*) n FROM task_queue WHERE status='failed'").get().n,
+      },
+      // 3-Tier cascade telemetry (dashboard pipeline panel)
+      cascade: {
+        tiers: { ...this._tiers },
+        lastTier: this._lastTier,
+        models: {
+          tier2: this.bridge.tier2 ? this.bridge.tier2.model : null,
+          tier3: this.bridge.modelChain[0],
+        },
       },
       workersHibernating: this.governor.db.prepare("SELECT COUNT(*) n FROM workers WHERE state='hibernating'").get().n,
     };

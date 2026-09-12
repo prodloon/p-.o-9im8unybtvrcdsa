@@ -54,6 +54,15 @@ class SkillInjector {
     return this.loadCatalog().map((e) => e.name);
   }
 
+  /** Full catalog for the Tier-1 template router: [{name, triggers, file}] */
+  catalogWithTriggers() {
+    try {
+      return this.loadCatalog();
+    } catch {
+      return []; // degraded: tier-1 falls through, never throws
+    }
+  }
+
   /** Read + basic-validate a skill script's content. */
   readSkill(name) {
     const entry = this.loadCatalog().find((e) => e.name === name);
@@ -64,20 +73,23 @@ class SkillInjector {
   }
 
   /**
-   * Route a supervisor verdict to an injection decision.
+   * Route a verdict to an injection decision.
+   * @param {string} [source='supervisor'] provenance tag recorded in skill_events
+   *   ('supervisor' = tier-3 cloud, 'tier2-local' = Ollama triage, kept distinct
+   *   from 'local-fallback' which means the offline keyword snipe).
    * @returns {{injected:boolean, source:string, skill:object|null, reason:string}}
    */
-  applyVerdict(verdict, workerId, taskId) {
+  applyVerdict(verdict, workerId, taskId, source = 'supervisor') {
     if (verdict && verdict.inject === true && verdict.skill) {
       const skill = this.readSkill(verdict.skill);
       if (skill) {
-        this.governor.logSkillEvent(workerId, verdict.skill, 'supervisor', 'applied');
-        return { injected: true, source: 'supervisor', skill, reason: 'supervisor verdict' };
+        this.governor.logSkillEvent(workerId, verdict.skill, source, 'applied');
+        return { injected: true, source, skill, reason: `${source} verdict` };
       }
-      this.governor.logSkillEvent(workerId, verdict.skill, 'supervisor', 'failed');
-      return { injected: false, source: 'supervisor', skill: null, reason: `unknown skill '${verdict.skill}'` };
+      this.governor.logSkillEvent(workerId, verdict.skill, source, 'failed');
+      return { injected: false, source, skill: null, reason: `unknown skill '${verdict.skill}'` };
     }
-    return { injected: false, source: 'supervisor', skill: null, reason: verdict ? 'verdict declined injection' : 'no verdict' };
+    return { injected: false, source, skill: null, reason: verdict ? 'verdict declined injection' : 'no verdict' };
   }
 
   /**

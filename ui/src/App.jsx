@@ -121,6 +121,45 @@ const AgentTable = React.memo(function AgentTable({ workers, hostStats, perWorke
   );
 });
 
+/** 3-Tier cascade pipeline: per-cycle tier distribution + model pins + last route. */
+function CascadePanel({ cascade }) {
+  const tiers = cascade?.tiers || {};
+  const last = cascade?.lastTier;
+  const total = Object.values(tiers).reduce((a, v) => a + (v || 0), 0);
+  const rows = [
+    { key: 'tier1-template', label: 'T1 · skill templates', model: 'skillbase (local)', tone: 'bg-emerald-500' },
+    { key: 'tier2-local', label: 'T2 · local LLM', model: cascade?.models?.tier2 || 'ollama', tone: 'bg-sky-500' },
+    { key: 'supervisor', label: 'T3 · cloud frontier', model: cascade?.models?.tier3 || 'openrouter', tone: 'bg-violet-500' },
+    { key: 'local-fallback', label: 'fallback · keyword snipe', model: 'keyword-triggers', tone: 'bg-slate-500' },
+  ];
+  return (
+    <div className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4">
+      <div className="mb-2 flex items-baseline justify-between">
+        <span className="text-xs font-medium uppercase tracking-wider text-slate-400">Supervisor pipeline</span>
+        <span className="text-xs text-slate-500">{total} consults this cycle</span>
+      </div>
+      {rows.map((r) => {
+        const n = tiers[r.key] || 0;
+        const pct = total ? (n / total) * 100 : 0;
+        return (
+          <div key={r.key} className="mb-1.5">
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-300">{r.label} <span className="text-slate-500">· {r.model}</span></span>
+              <span className="font-mono text-slate-400">{n}</span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-slate-700/60">
+              <div className={`h-full rounded-full ${r.tone}`} style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        );
+      })}
+      <div className="mt-2 text-[10px] text-slate-600">
+        last route: {last ? `${last.source} (${last.model ?? '?'}) in ${last.latencyMs ?? 0}ms` : 'none yet'}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [sample, setSample] = useState(null);
   const [connected, setConnected] = useState(false);
@@ -196,7 +235,7 @@ export default function App() {
         />
       </div>
 
-      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4">
           <div className="mb-1 text-xs font-medium uppercase tracking-wider text-slate-400">RAM % (last {MAX_HISTORY}s)</div>
           <Spark data={ramHistory} tone={ramPct >= 80 ? '#fb7185' : '#38bdf8'} />
@@ -209,6 +248,7 @@ export default function App() {
             <div className="flex justify-between"><span>Hibernating workers</span><span className="font-mono">{sample?.workersHibernating ?? 0}</span></div>
           </div>
         </div>
+        <CascadePanel cascade={sample?.cascade} />
       </div>
 
       <div className="mt-4">

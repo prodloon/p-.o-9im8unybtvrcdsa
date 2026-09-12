@@ -183,8 +183,8 @@ async function main() {
     check('payload matches knowledge.md §5 shape', payload.worker_id === 'w-0001' && payload.skills_catalog.length === 1 && typeof payload.task_summary === 'string');
 
     const res = await bridge.getVerdict(payload);
-    check('verdict parsed from primary model', res.ok && res.model === POLICY.PRIMARY_MODEL && res.verdict.skill === 'scaffold-express-api' && res.verdict.inject === true);
-    check('primary model used first', calls[0].model === 'anthropic/claude-3.5-sonnet');
+    check('verdict parsed from tier-3 primary', res.ok && res.model === POLICY.TIER3_MODEL && res.verdict.skill === 'scaffold-express-api' && res.verdict.inject === true);
+    check('tier-3 primary used first', calls[0].model === POLICY.TIER3_MODEL);
     check('exactly one HTTP call', calls.length === 1);
   }
 
@@ -215,7 +215,7 @@ async function main() {
       apiKey: 'test-key',
       fetchImpl: async (url, opts) => {
         calls.push(JSON.parse(opts.body).model);
-        if (JSON.parse(opts.body).model === POLICY.PRIMARY_MODEL) {
+        if (JSON.parse(opts.body).model === POLICY.TIER3_MODEL) {
           return { ok: false, status: 429, headers: { get: () => '0' }, text: async () => 'rl' };
         }
         return openRouterResponse('{"verdict":"delegate","skill":"api-route-map","confidence":0.8,"inject":true}');
@@ -224,7 +224,7 @@ async function main() {
     });
     const res = await bridge.getVerdict(bridge.buildRequestPayload({ workerId: 'w', taskKind: 'k', taskSummary: 'audit routes', skillsCatalog: ['api-route-map'] }));
     check('falls back to llama-3.3-70b after primary retries exhaust', res.ok && res.model === POLICY.FALLBACK_MODEL && res.verdict.skill === 'api-route-map');
-    check('chain order respected (3 primary attempts then fallback)', calls.length === 4 && calls.filter((m) => m === POLICY.PRIMARY_MODEL).length === 3 && calls[3] === POLICY.FALLBACK_MODEL, JSON.stringify(calls));
+    check('chain order respected (3 primary attempts then fallback)', calls.length === 4 && calls.filter((m) => m === POLICY.TIER3_MODEL).length === 3 && calls[3] === POLICY.FALLBACK_MODEL, JSON.stringify(calls));
   }
 
   // ============================================================================
@@ -239,10 +239,22 @@ async function main() {
       const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
       env.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'scaffold a new express api for users' });
       const stats = await orch.runCycle();
-      check('offline → local keyword sniping fired', stats.local === 1 && stats.cloud === 0);
-      check('task still completed via fallback skill', stats.tasksDone === 1);
+      check('offline → handled at $0 without any cloud call', stats.local === 1 && stats.cloud === 0);
+      check('task still completed via injected skill', stats.tasksDone === 1);
       const evt = env.governor.db.prepare("SELECT skill_name, source FROM skill_events ORDER BY id DESC LIMIT 1").get();
-      check('fallback recorded in skill_events', evt && evt.skill_name === 'scaffold-express-api' && evt.source === 'local-fallback');
+      check('tier-1 template handled the obvious match offline', evt && evt.skill_name === 'scaffold-express-api' && evt.source === 'tier1-template', JSON.stringify(evt));
+      check('cascade tier counters populated', stats.tiers['tier1-template'] === 1, JSON.stringify(stats.tiers));
+      // A summary with NO template match escalates T1→T2→T3 (tier2 mock
+      // fails, tier3 keyless) → nothing injects → the task burns its
+      // attempts in-cycle (same semantics as S10's poison task: per-attempt
+      // failure count, DB row ends failed with the pre-permanent attempts).
+      const injBefore = env.governor.db.prepare('SELECT COUNT(*) AS n FROM skill_events').get().n;
+      const t2 = env.governor.enqueueTask('file-io', { action: 'SNIPE', needsSkill: true, summary: 'design a sharding and replication strategy for the orders store' });
+      const stats2 = await orch.runCycle();
+      const t2row = env.governor.db.prepare('SELECT status, attempts FROM task_queue WHERE id=?').get(t2);
+      check('unmatched cognitive task escalates but is not force-injected', stats2.tasksDone === 0 && stats2.tasksFailed === 3 && t2row.status === 'failed' && t2row.attempts === 2, JSON.stringify({ stats2, t2row }));
+      const injDelta = env.governor.db.prepare('SELECT COUNT(*) AS n FROM skill_events').get().n - injBefore;
+      check('escalated task produced zero skill injections', injDelta === 0, `delta=${injDelta}`);
       orch.close();
     } finally {
       env.cleanup();
@@ -294,14 +306,19 @@ async function main() {
     try {
       const bridge = new SupervisorBridge({
         apiKey: 'test-key',
-        fetchImpl: async () => openRouterResponse('{"verdict":"delegate","skill":"scaffold-express-api","confidence":0.93,"inject":true}'),
+        // Tier-2 calls (Ollama shape) return an unparseable verdict → the
+        // cascade MUST escalate; the OpenRouter call returns the real verdict.
+        fetchImpl: async (url) => (String(url).includes('11434')
+          ? { ok: true, status: 200, json: async () => ({ message: { content: '{}' } }) }
+          : openRouterResponse('{"verdict":"delegate","skill":"scaffold-express-api","confidence":0.93,"inject":true}')),
         sleep: async () => {},
       });
       const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
 
-      env.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'scaffold express api for orders' });
+      // No catalog triggers in this summary → escalates past tier 1 and 2.
+      env.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'architect a sharding and replication strategy for the orders store' });
       const stats = await orch.runCycle();
-      check('cloud consulted once', stats.cloud === 1);
+      check('cascade escalated T1→T2→T3 cloud', stats.cloud === 1 && stats.tiers.supervisor === 1, JSON.stringify(stats.tiers));
       check('task done via injected skill', stats.tasksDone === 1);
       const evt = env.governor.db.prepare("SELECT skill_name, source FROM skill_events WHERE source='supervisor'").get();
       check('supervisor injection logged', evt && evt.skill_name === 'scaffold-express-api');

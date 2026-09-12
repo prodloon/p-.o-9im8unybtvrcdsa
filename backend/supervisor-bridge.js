@@ -17,7 +17,15 @@
  */
 
 const POLICY = {
-  PRIMARY_MODEL: 'anthropic/claude-3.5-sonnet',
+  // --- 3-Tier COST LAW (knowledge.md §9) ----------------------------------
+  // Tier 1: local skillbase templates — $0 (implemented in routeTask)
+  // Tier 2: local Ollama qwen2.5:7b triage — free, offline, ~15s cold
+  // Tier 3: frontier brain via OpenRouter (tilde alias → current sonnet)
+  TIER2_OLLAMA_MODEL: process.env.DAISY_TIER2_MODEL || 'qwen2.5:7b',
+  OLLAMA_URL: process.env.DAISY_OLLAMA_URL || 'http://127.0.0.1:11434/api/chat',
+  OLLAMA_TIMEOUT_MS: Number(process.env.DAISY_OLLAMA_TIMEOUT_MS) || 120_000, // generous: covers cold start
+  OLLAMA_MAX_TOKENS: 220,
+  TIER3_MODEL: process.env.DAISY_TIER3_MODEL || '~anthropic/claude-sonnet-latest', // live-verified alias
   FALLBACK_MODEL: 'meta-llama/llama-3.3-70b-instruct',
   ENDPOINT: 'https://openrouter.ai/api/v1/chat/completions',
   MAX_ATTEMPTS_PER_MODEL: 3,
@@ -25,6 +33,11 @@ const POLICY = {
   MAX_BACKOFF_MS: 8000,
   REQUEST_TIMEOUT_MS: 30000,
 };
+
+const LEGACY_MODELS = new Set([
+  'anthropic/claude-3.5-sonnet',
+  'anthropic/claude-sonnet-latest', // bare form is invalid; tilde alias verified live
+]);
 
 const SYSTEM_PROMPT = [
   'You are the Cloud Supervisor of the Daisy Chain multi-agent cluster.',
@@ -50,7 +63,18 @@ class SupervisorBridge {
     this.sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.apiKey = opts.apiKey !== undefined ? opts.apiKey : process.env.OPENROUTER_API_KEY || null;
     this.endpoint = opts.endpoint || POLICY.ENDPOINT;
-    this.modelChain = [POLICY.PRIMARY_MODEL, POLICY.FALLBACK_MODEL];
+    // Tier-3 model chain: frontier brain first, cheap cloud fallback last.
+    this.modelChain = [
+      opts.tier3Model || POLICY.TIER3_MODEL,
+      opts.fallbackModel || POLICY.FALLBACK_MODEL,
+    ];
+    // Tier-2 gate (injectable for tests): null/false disables Ollama.
+    this.tier2 = opts.tier2 !== undefined ? opts.tier2 : {
+      url: POLICY.OLLAMA_URL,
+      model: POLICY.TIER2_OLLAMA_MODEL,
+      timeoutMs: POLICY.OLLAMA_TIMEOUT_MS,
+      maxTokens: POLICY.OLLAMA_MAX_TOKENS,
+    };
     if (!this.apiKey) {
       console.warn('[bridge] OPENROUTER_API_KEY not set — cloud calls will fail until it is');
     }
@@ -127,6 +151,109 @@ class SupervisorBridge {
         await this.sleep(backoff);
       }
     }
+  }
+
+  /**
+   * Tier 1 — local skillbase template router ($0). Routine formatting,
+   * pattern matching, and rule checks never leave the machine. Matches the
+   * task summary against catalog triggers (same scoring as the offline
+   * snipe); a confident single-match routes to a template verdict.
+   * @returns {object|null} verdict, or null to escalate down the cascade
+   */
+  routeTier1(task, catalog) {
+    const text = String(task.task_summary || '').toLowerCase();
+    if (!text || !Array.isArray(catalog) || catalog.length === 0) return null;
+    const scored = catalog
+      .map((e) => ({
+        name: e.name,
+        score: (e.triggers || []).filter((t) => text.includes(String(t).toLowerCase())).length,
+      }))
+      .filter((s) => s.score > 0)
+      .sort((a, b) => b.score - a.score);
+    // Confident only when a single template clearly wins (no ambiguity).
+    if (scored.length >= 1 && (scored.length === 1 || scored[0].score > scored[1].score)) {
+      return {
+        verdict: 'delegate',
+        skill: scored[0].name,
+        confidence: Math.min(0.95, 0.6 + 0.1 * scored[0].score),
+        inject: true,
+        reason: `tier1 template match (${scored[0].score} triggers)`,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Tier 2 — mid-level triage on local Ollama (free, offline-capable).
+   * Uses OpenAI-compatible /api/chat with JSON mode. Returns a verdict or
+   * null on any failure (model missing, timeout, malformed) — null always
+   * means "escalate", never "fail the task".
+   */
+  async _askTier2(payload) {
+    const t2 = this.tier2;
+    if (!t2) return null;
+    try {
+      const res = await this.fetchImpl(t2.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: t2.model,
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: JSON.stringify(payload) },
+          ],
+          stream: false,
+          format: 'json',
+          options: { temperature: 0.2, num_predict: t2.maxTokens },
+        }),
+        signal: AbortSignal.timeout(t2.timeoutMs),
+      });
+      if (!res.ok) return null;
+      const body = await res.json();
+      const content = (body && body.message && body.message.content) || '';
+      return this._parseVerdict({ choices: [{ message: { content } }] });
+    } catch {
+      return null; // timeout/offline/malformed → escalate to Tier 3
+    }
+  }
+
+  /**
+   * THE CASCADE GATEKEEPER (knowledge.md §9 cost law).
+   * Route one consult through 3 tiers:
+   *   T1 local skillbase templates ($0) → T2 local Ollama triage ($0) →
+   *   T3 frontier cloud brain (OpenRouter, full retry + fallback chain).
+   * @param {object} task      Supervisor request payload (knowledge.md §5)
+   * @param {Array}  catalog   [{name, triggers}] from SkillInjector.catalogWithTriggers()
+   * @returns {{source:'tier1-template'|'tier2-local'|'supervisor', model:string|null,
+   *                 verdict:object|null, error?:string, attempts?:number, latencyMs:number}}
+   */
+  async routeTask(task, catalog = []) {
+    const t0 = this.clock();
+
+    // --- Tier 1: local templates ----------------------------------------
+    const t1 = this.routeTier1(task, catalog);
+    if (t1) {
+      return { source: 'tier1-template', model: 'skillbase-templates', verdict: t1, attempts: 0, latencyMs: this.clock() - t0 };
+    }
+
+    // --- Tier 2: local Ollama triage -------------------------------------
+    if (this.tier2) {
+      const t2verdict = await this._askTier2(task);
+      if (t2verdict) {
+        return { source: 'tier2-local', model: this.tier2.model, verdict: t2verdict, attempts: 0, latencyMs: this.clock() - t0 };
+      }
+    }
+
+    // --- Tier 3: frontier cloud brain ------------------------------------
+    const res = await this.getVerdict(task); // full retry/backoff + model chain
+    return {
+      source: res.ok ? 'supervisor' : 'cloud-unavailable',
+      model: res.model || null,
+      verdict: res.ok ? res.verdict : null,
+      error: res.ok ? undefined : res.error,
+      attempts: res.attempts || 0,
+      latencyMs: this.clock() - t0,
+    };
   }
 
   /** Ask the Supervisor for a verdict on a worker task. */
