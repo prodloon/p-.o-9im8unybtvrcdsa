@@ -218,6 +218,32 @@ cmd_stop() {
 }
 
 # ============================================================================
+# doctor — lives in scripts/cluster_doctor.sh (single source of truth; it is
+# also sourced by scripts/cluster.sh, so `cluster.sh doctor` and
+# `clusterctl.sh doctor` run the SAME diagnostics). Loaded lazily below.
+clusterctl_doctor() {
+  if [ -f "$ROOT/scripts/cluster_doctor.sh" ]; then
+    # The doctor fragment expects the same pinned-model vars cluster.sh
+    # defines; provide them here (keep values in sync with cluster.sh §5.5).
+    OLLAMA_BASE="${OLLAMA_BASE:-http://localhost:11434}"
+    TIER2_MODEL="${TIER2_MODEL:-qwen2.5:7b}"
+    TIER3_MODEL="${TIER3_MODEL:-~anthropic/claude-sonnet-latest}"
+    ENVFILE="${ENVFILE:-$ROOT/.env}"
+    PAUSE_FILE="$ROOT/.run/supervisor.paused"
+    AGENT_LABEL="com.daisy.cluster"
+    AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+    APP_AGENT_LABEL="com.daisy.cluster.app"
+    APP_AGENT_PLIST="$HOME/Library/LaunchAgents/$APP_AGENT_LABEL.plist"
+    # shellcheck source=cluster_doctor.sh
+    . "$ROOT/scripts/cluster_doctor.sh"
+    cmd_doctor
+  else
+    warn "doctor script missing: $ROOT/scripts/cluster_doctor.sh"
+    return 2
+  fi
+}
+
+# ============================================================================
 cmd_status() {
   local rc=0
   echo "Daisy cluster status — $(date '+%H:%M:%S')"
@@ -281,6 +307,14 @@ cmd_status() {
   else
     printf "  %-18s %-8s %s—%s\n" "app-backend" "-" "$c_dim" "$c_off"
   fi
+  # App login-autostart agent (managed by scripts/cluster.sh, informational).
+  if [ -f "$HOME/Library/LaunchAgents/com.daisy.cluster.app.plist" ] || launchctl print "gui/$(id -u)/com.daisy.cluster.app" >/dev/null 2>&1; then
+    if launchctl print "gui/$(id -u)/com.daisy.cluster.app" >/dev/null 2>&1; then
+      printf "  %-18s %-8s %s✓ loaded%s · opens the app at login\n" "app-autostart" "-" "$c_green" "$c_off"
+    else
+      printf "  %-18s %-8s %s! plist present but not loaded%s\n" "app-autostart" "-" "$c_amber" "$c_off"
+    fi
+  fi
   # App telemetry freshness (its own file, its own clock) — informational.
   if [ -f "$appdb/telemetry.json" ]; then
     local age
@@ -321,7 +355,31 @@ cmd_task() {
   exec "$NODE_BIN" backend/index.js --enqueue "$1"
 }
 
+doctor_raw() { # doctor_raw — status-side probes (live, no header/foot)
+  local o="$(orch_pid)" t="$(telemetry_pid)" v="$(vite_pid)" s="$(shell_pid)"
+  local aorch="$(app_backend_pid 2>/dev/null)" inst="$(installed_shell_pid 2>/dev/null)"
+  echo "REPO_PID_ORCH=$o"; echo "REPO_PID_TELEM=$t"; echo "REPO_PID_VITE=$v"; echo "REPO_PID_SHELL=$s"
+  echo "APP_PID_SHELL=$inst"; echo "APP_PID_BACKEND=$aorch"
+  local sup="$(pgrep -f "scripts/cluster[.]sh supervise" 2>/dev/null | head -1)"; echo "SUPERVISOR_PID=$sup"
+  local supervoloaded=0; [ -n "$sup" ] && kill -0 "$sup" 2>/dev/null && supervoloaded=1; echo "SUPERVISOR_LOADED=$supervoloaded"
+  if [ -f "$ROOT/.run/supervisor.paused" ]; then echo "SUPERVISOR_PAUSED=1"; else echo "SUPERVISOR_PAUSED=0"; fi
+  echo "TELEFRESH=$(if [ -f "$ROOT/database/telemetry.json" ]; then "$NODE_BIN" -e "try{console.log(Math.floor(Date.now()-require('fs').statSync('$ROOT/database/telemetry.json').mtimeMs));process.exit(0)}catch{console.log(999999);process.exit(0)}" 2>/dev/null || echo 999999; else echo 999999; fi)"
+  echo "TELEMHTTP=$(curl -sf -m 2 "http://127.0.0.1:$TELEMETRY_PORT/api/telemetry" >/dev/null 2>&1 && echo 1 || echo 0)"
+  echo "APPTELEMFILE=$(test -f "$HOME/Library/Application Support/DaisyCluster/database/telemetry.json" && echo 1 || echo 0)"
+  if [ "$(test -f "$HOME/Library/Application Support/DaisyCluster/database/telemetry.json" && echo 1 || echo 0)" = "1" ]; then
+    echo "APPTELEMFRESH=$(python3 -c "import os,time;print(int(max(0,(time.time()-os.path.getmtime(os.path.expanduser('$HOME/Library/Application Support/DaisyCluster/database/telemetry.json'))))) if __name__=='__main__' else 0)" 2>/dev/null || echo '?')"
+  else echo "APPTELEMFRESH=never"; fi
+  echo "APPKEYFILE=$(test -f "$HOME/Library/Application Support/DaisyCluster/.env" && echo 1 || echo 0)"
+  echo "OLLAMA_BASE=$OLLAMA_BASE"; echo "TIER2_MODEL=$TIER2_MODEL"; echo "TIER3_MODEL=$TIER3_MODEL"
+  echo "OLLAMA_UP=$(curl -sf -m 3 "$OLLAMA_BASE/api/tags" >/dev/null 2>&1 && echo 1 || echo 0)"
+  echo "OLLAMA_MODEL=$(curl -sf -m 8 "$OLLAMA_BASE/api/tags" 2>/dev/null | python3 -c "import sys,json;print(1 if any(any(m.get('name','').startswith('$TIER2_MODEL') for m in data.get('models',[])) for data in [json.load(sys.stdin)] if data) else 0)" 2>/dev/null || echo '?')"
+  # App backend residency via /api/ps (the real keep_alive signal).
+  echo "OLLAMA_RESIDENT=$(curl -sf -m 8 "$OLLAMA_BASE/api/ps" 2>/dev/null | python3 -c "import sys,json;print(1 if any(any((d.get('name','')=='$TIER2_MODEL' or d.get('name','').startswith('$TIER2_MODEL') or d.get('model','')=='$TIER2_MODEL') for d in data.get('models',[])) for data in [json.load(sys.stdin)] if data) else 0)" 2>/dev/null || echo '?')"
+  echo "SPOKEN_TIER2=$(test -f "$ROOT/database/telemetry.json" && python3 -c "import json,os;try:print(next((e.get('meta',{}).get('tier2Spoken') or 0) for e in list(reversed(json.load(open('$ROOT/database/telemetry.json')).skill_events)) if e.get('kind') in ('tier2','tier2-rejected') and e.get('meta',{}).get('tier2Spoken')));except:print(0)" 2>/dev/null || echo '?')"
+}
+
 case "${1:-help}" in
+  doctor) clusterctl_doctor ;;
   start)   shift; cmd_start "$@" ;;
   stop)    cmd_stop ;;
   restart) shift; cmd_stop; cmd_start "$@" ;;
