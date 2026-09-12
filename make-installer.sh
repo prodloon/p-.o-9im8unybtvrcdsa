@@ -115,7 +115,8 @@ else
     if grep -q "telemetry emit loop live" /tmp/daisy-verify-out.log 2>/dev/null; then break; fi
     sleep 1
   done
-  GOT=$(grep "telemetry emit loop live" /tmp/daisy-verify-out.log 2>/dev/null | head -1 | sed 's/.*live: //' | tr -d '"')
+  # Proof-line parse lives in scripts/freeze_drill.py (unit-tested).
+  GOT=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[2]); from freeze_drill import emit_loop_path; p = emit_loop_path(sys.argv[1]); print(p if p else "")' /tmp/daisy-verify-out.log "$ROOT/scripts" 2>/dev/null || true)
 
   # The backend process (child of this GUI) — needed for the reap check.
   BE=""
@@ -141,17 +142,10 @@ else
   # Freshness: the proof line proves the SHELL's path, but a wrong-path
   # BACKEND leaves a stale leftover at $WANT that the shell happily re-emits
   # (stale files lie — same lesson as the watcher's boot false-alarm).
-  # Demand a fresh write: it proves the data at $WANT is live, not a leftover.
-  FRESH=""
-  for i in $(seq 1 15); do
-    if [ -e "$WANT" ]; then
-      AGE=$(( $(date +%s) - $(stat -f %m "$WANT") ))
-      if [ "$AGE" -lt 12 ]; then FRESH=1; break; fi
-    fi
-    sleep 1
-  done
-  if [ -z "$FRESH" ]; then
-    echo "  ✗ telemetry at $WANT is not being written (stale leftover?) — backend writes elsewhere"; FAIL=1
+  # Demand a fresh write via scripts/freeze_drill.py — the shared, unit-tested
+  # harness (also used by freeze drills); exit code IS the verdict.
+  if ! python3 "$ROOT/scripts/freeze_drill.py" fresh --file "$WANT" --max-age 12 --timeout 15; then
+    FAIL=1
   fi
 
   # Cleanup regardless of verdict. Graceful AppleScript quit works only for

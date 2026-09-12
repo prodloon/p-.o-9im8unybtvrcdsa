@@ -16,8 +16,12 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+import freeze_drill as fdh
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 NODE = "/usr/local/bin/node"
@@ -279,6 +283,73 @@ def suite_frozen_files():
 
 
 # ---------------------------------------------------------------------------
+def suite_drill_harness():
+    """S19: scripts/freeze_drill.py — the shared staleness/freshness harness
+    used by app freeze drills AND installer stage-5 verification. Hermetic:
+    all state lives in a temp dir, no live cluster needed."""
+    S = "drill"
+    check(S, "frozen module imports cleanly", True)  # import at top proves it
+
+    NOW = 1_000_000_000.0  # fixed wall clock (s) for boundary math
+    T0 = 1_000_000_000.0
+    check(S, "badge_state: fresh ts → live (≤5s)",
+          fdh.badge_state((T0 - 4.2) * 1000, now_ms=T0 * 1000) == "live")
+    check(S, "badge_state: exact boundary is live (age == 5000ms)",
+          fdh.badge_state((T0 - 5.0) * 1000, now_ms=T0 * 1000) == "live")
+    check(S, "badge_state: past boundary → stale",
+          fdh.badge_state((T0 - 5.001) * 1000, now_ms=T0 * 1000) == "stale")
+    check(S, "badge_state: missing ts → unknown (not live)",
+          fdh.badge_state(None) == "unknown")
+
+    tmp = os.path.join(tempfile.mkdtemp(prefix="s19-"), "telemetry.json")
+    check(S, "file_age/is_fresh: missing file is not fresh",
+          fdh.file_age_s(tmp) is None and fdh.is_fresh(tmp) is False)
+    with open(tmp, "w") as f:
+        json.dump({"ts": 1}, f)
+    os.utime(tmp, (NOW - 30, NOW - 30))
+    check(S, "is_fresh: 30s-old file fails a 12s bound",
+          fdh.is_fresh(tmp, max_age_s=12, now=NOW) is False)
+    check(S, "wait_for_fresh: times out on a stale leftover (exit-1 shape)",
+          fdh.wait_for_fresh(tmp, max_age_s=12, timeout_s=1.5, poll_s=0.2) is False)
+    os.utime(tmp, (NOW, NOW))
+    check(S, "is_fresh: just-written file passes",
+          fdh.is_fresh(tmp, max_age_s=12, now=NOW) is True)
+    check(S, "payload_ts: parses json ts, rejects junk",
+          fdh.payload_ts(tmp) == 1 and fdh.payload_ts(tmp + ".nope") is None)
+
+    log = os.path.join(tempfile.mkdtemp(prefix="s19-log-"), "shell.log")
+    with open(log, "w") as f:
+        f.write('[shell] backend spawned (/usr/local/bin/node 123)\n'
+                '[shell] telemetry emit loop live: '
+                '"/Users/x/Library/Application Support/DaisyCluster/'
+                'database/telemetry.json"\n')
+    got = fdh.emit_loop_path(log)
+    check(S, "emit_loop_path: extracts the real Application Support path",
+          got == "/Users/x/Library/Application Support/DaisyCluster/"
+          "database/telemetry.json", got)
+    check(S, "emit_loop_path: absent line → None (build must fail closed)",
+          fdh.emit_loop_path(log + ".empty") is None)
+
+    # CLI end-to-end: `fresh` exit codes are the installer's verdict.
+    # (The CLI compares against the REAL clock, so staleness here comes from
+    # os.utime to a past epoch — the fixed NOW constant is only for the pure
+    # functions above, which take `now` as a parameter.)
+    def _run_fresh():
+        return subprocess.run(
+            [sys.executable, os.path.join(ROOT, "scripts", "freeze_drill.py"),
+             "fresh", "--file", tmp, "--max-age", "12", "--timeout", "0.5",
+             "--interval", "0.1"], capture_output=True, text=True)
+
+    os.utime(tmp, (NOW - 3600, NOW - 3600))  # an hour before year-2001 → very stale
+    stale_run = _run_fresh()
+    check(S, "CLI fresh: stale file exits 1 with the installer's verdict line",
+          stale_run.returncode == 1 and "not being written" in stale_run.stderr,
+          stale_run.stderr.strip()[:70])
+    os.utime(tmp)  # touch → mtime = real now → fresh
+    check(S, "CLI fresh: fresh file exits 0", _run_fresh().returncode == 0)
+
+
+# ---------------------------------------------------------------------------
 def main():
     print("🌼 Daisy Cluster self-test battery (Phase 6)")
     print("=" * 60)
@@ -289,6 +360,7 @@ def main():
     suite_shell_artifacts()
     suite_control_script()
     suite_frozen_files()
+    suite_drill_harness()
 
     print("\n" + "=" * 60)
     suites = {}
