@@ -15,6 +15,8 @@ database/*.sqlite-wal
 database/*.sqlite-shm
 database/telemetry.json
 database/*.log
+logs/
+.run/
 daisy_sandbox_cluster/
 src-tauri/target/
 ui/dist/

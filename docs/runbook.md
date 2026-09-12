@@ -17,6 +17,36 @@ Architecture and session history live in `knowledge.md`; this file is the
 
 ## 1. Starting the cluster
 
+**One command — the whole stack** (preferred):
+```bash
+cd ~/daisy-chain
+./clusterctl.sh start --shell   # desktop shell + dashboard + telemetry
+./clusterctl.sh start           # headless orchestrator + telemetry + dashboard
+./clusterctl.sh start --no-ui   # headless, no vite
+```
+
+Everything else is a wrapper around clusterctl now:
+
+```bash
+./clusterctl.sh status          # service table + health probes (exit 0 = all green)
+./clusterctl.sh logs [svc] [n]  # orchestrator|shell|telemetry|vite|all
+./clusterctl.sh task '<json>'   # enqueue one task
+./clusterctl.sh restart [--shell]
+./clusterctl.sh stop            # pidfiles + port sweep; kills shell last
+```
+
+Notes:
+- `OPENROUTER_API_KEY` is loaded automatically from the gitignored `.env` —
+  no exports needed.
+- **Never run a headless orchestrator while the desktop shell is up** — the
+  shell owns its own backend; `start` refuses and tells you.
+- Children are spawned session-detached (python `start_new_session`) —
+  they survive terminal closes.
+
+---
+
+### Legacy manual methods (still work; clusterctl adopts them)
+
 **Headless (orchestrator only):**
 ```bash
 cd ~/daisy-chain
@@ -84,16 +114,19 @@ LaunchAgent/cron-driven operation without a resident process.
 
 ## 5. Stopping
 
-- Shell window: close it (child reaper kills the backend).
-- Headless: Ctrl-C the `--serve` process. SQLite is crash-safe (WAL);
-  mid-task leases expire after 60s + 10s grace and tasks auto-requeue.
+- **`./clusterctl.sh stop`** — the one command (orchestrator → shell →
+  telemetry → dashboard, then an orphan port sweep). SQLite is crash-safe
+  (WAL); mid-task leases expire after 60s + 10s grace and tasks auto-requeue.
+- Shell window: closing it also works (child reaper kills the backend),
+  then `./clusterctl.sh stop` for the remaining helpers.
+- Headless: Ctrl-C the `--serve` process equally works.
 
 ## 6. Verification (run after any change)
 
 ```bash
-node governor/governor.selftest.js     # 43 checks
-node backend/backend.selftest.js       # 47 checks
-~/daisy_env/bin/python daisy_cluster_selftest.py   # 40 checks, end-to-end
+node governor/governor.selftest.js     # 56 checks
+node backend/backend.selftest.js       # 61 checks
+~/daisy_env/bin/python daisy_cluster_selftest.py   # end-to-end, incl. clusterctl
 ```
 
 All three green = launch-ready. The Python battery also asserts the legacy

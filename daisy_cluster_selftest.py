@@ -206,9 +206,32 @@ def suite_shell_artifacts():
           cargo.stderr.strip().splitlines()[-1] if cargo.returncode else "")
 
 
+def suite_control_script():
+    """clusterctl.sh — the single control surface (start/stop/status/logs)."""
+    print("== SUITE 7: CONTROL SCRIPT (clusterctl.sh) ==")
+    ctl = os.path.join(ROOT, "clusterctl.sh")
+    check("ctl", "script exists + executable", os.path.exists(ctl) and os.access(ctl, os.X_OK))
+
+    syntax = subprocess.run(["bash", "-n", ctl], capture_output=True, text=True, timeout=30)
+    check("ctl", "bash syntax clean", syntax.returncode == 0, syntax.stderr[:120])
+
+    status = subprocess.run([ctl, "status"], capture_output=True, text=True, timeout=60)
+    check("ctl", "status runs and prints the service table",
+          status.returncode in (0, 1) and "SERVICE" in status.stdout,
+          status.stderr[:120])
+    check("ctl", "status exits 0 when the stack is up", status.returncode == 0,
+          "stack down during battery" if status.returncode else "")
+    if status.returncode == 0:
+        check("ctl", "status reports at least one service up", "✓ up" in status.stdout)
+        check("ctl", "status live line parses telemetry", "live: cycle" in status.stdout)
+
+    help_r = subprocess.run([ctl, "logs", "all", "1"], capture_output=True, text=True, timeout=30)
+    check("ctl", "logs command is graceful", help_r.returncode == 0)
+
+
 def suite_frozen_files():
     """The legacy daisy_*.py files must be untouched by all cluster work."""
-    print("== SUITE 6: FROZEN LEGACY FILES ==")
+    print("== SUITE 8: FROZEN LEGACY FILES ==")
     for name in FROZEN_FILES:
         path = os.path.join(ROOT, name)
         ok = os.path.exists(path) and os.path.getsize(path) == FROZEN_SIZES.get(name)
@@ -228,6 +251,7 @@ def main():
     suite_live_pipeline()
     suite_telemetry()
     suite_shell_artifacts()
+    suite_control_script()
     suite_frozen_files()
 
     print("\n" + "=" * 60)
