@@ -196,6 +196,16 @@ http.get(u, { timeout: 8000 }, (res) => {
   else
     ok "Supervisor pause: not paused"
   fi
+  # Crash-loop guard state: consecutive-failure counter + halt marker.
+  local failstreak=0
+  [ -f "$FAIL_FILE" ] && failstreak=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+  if [ -f "${HALT_FILE:-/nonexistent}" ]; then
+    fail "Supervisor HALTED: crash-loop guard tripped (healing stopped) - resume with: scripts/cluster.sh restart or clear-halt"
+  elif [ "$failstreak" -gt 0 ] 2>/dev/null; then
+    warn "Boot-failure streak: $failstreak/${MAX_CONSECUTIVE_FAILED_BOOTS:-5} consecutive - guard halts healing at the limit"
+  else
+    ok "Crash-loop guard: armed (halts healing after ${MAX_CONSECUTIVE_FAILED_BOOTS:-5} consecutive failed boots), streak 0"
+  fi
   if [ -f "$AGENT_PLIST" ]; then
     if launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
       ok "LaunchAgent loaded: $AGENT_LABEL"

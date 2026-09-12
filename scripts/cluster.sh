@@ -12,7 +12,13 @@
 #   scripts/cluster.sh restart  stop, then start
 #   scripts/cluster.sh supervise    boot once, then heal: every 15 s restore
 #                               any dead core service (this is what the
-#                               LaunchAgent runs; exit ≠ 0 only if boot fails)
+#                               LaunchAgent runs). CRASH-LOOP GUARD: after
+#                               MAX_CONSECUTIVE_FAILED_BOOTS failed boots or
+#                               heals in a row (default 5; override with
+#                               DAISY_MAX_BOOT_FAILURES in .env) the supervisor
+#                               HALTS — alert + .run/supervisor.halted — instead
+#                               of healing forever; restart or clear-halt resumes.
+#   scripts/cluster.sh clear-halt   resume a supervisor halted by the guard
 #   scripts/cluster.sh install-agent [--unload-first]   write + load the
 #                               LaunchAgent (login autostart + self-heal)
 #   scripts/cluster.sh uninstall-agent [--keep-running] remove the agent
@@ -48,8 +54,11 @@ AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 APP_AGENT_LABEL="com.daisy.cluster.app"         # LaunchAgent: open the installed app at login
 APP_AGENT_PLIST="$HOME/Library/LaunchAgents/$APP_AGENT_LABEL.plist"
 APP_BUNDLE="/Applications/Daisy Cluster.app"
-SUPERVISOR_INTERVAL=15                           # heal-check cadence (s)
+SUPERVISOR_INTERVAL="${DAISY_SUPERVISOR_INTERVAL:-15}"  # heal-check cadence (s)
 PAUSE_FILE="$ROOT/.run/supervisor.paused"
+HALT_FILE="$ROOT/.run/supervisor.halted"        # crash-loop guard: written when healing suspends itself
+FAIL_FILE="$ROOT/.run/supervisor.bootfailures"  # guard state: consecutive failed boot/heal counter
+MAX_CONSECUTIVE_FAILED_BOOTS="${DAISY_MAX_BOOT_FAILURES:-5}"
 WARM_TIER2="${DAISY_WARM_TIER2:-1}"             # default ON: pre-load qwen weights at boot (removes the ~20s cold start on first consult)
 # Residency policy — MUST match bridge POLICY.OLLAMA_KEEP_ALIVE. GOTCHA:
 # Ollama parses keep_alive as a Go duration; the STRING "-1" is rejected
@@ -70,6 +79,17 @@ log()  { printf '\033[36m[cluster]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m  ✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m  ⚠\033[0m %s\n' "$*"; }
 fail() { printf '\033[31m  ✗\033[0m %s\n' "$*"; }
+
+# alert: get a halt in front of the human — log line + best-effort macOS
+# notification (the supervisor runs headless under launchd; nobody is tailing
+# its log when things go wrong). DAISY_ALERT=0 silences the notification
+# (tests, CI) — the ALERT log line always fires.
+alert() {
+  log "ALERT: $*"
+  [ "${DAISY_ALERT:-1}" = "1" ] || return 0
+  command -v osascript >/dev/null 2>&1 && \
+    osascript -e "display notification \"$*\" with title \"Daisy supervisor\" sound name \"Basso\"" >/dev/null 2>&1 || true
+}
 
 # --- preflight: WAL database + schema present (Tier-1 persistence) ----------
 db_preflight() {
@@ -170,6 +190,8 @@ supervisor_pid() { pgrep -f "bash .*scripts/cluster[.]sh supervise" 2>/dev/null 
 pause_supervisor() { mkdir -p "$(dirname "$PAUSE_FILE")"; date +%s > "$PAUSE_FILE"; }
 clear_pause() { rm -f "$PAUSE_FILE"; }
 paused_at() { [ -f "$PAUSE_FILE" ] && cat "$PAUSE_FILE" 2>/dev/null || echo 0; }
+supervisor_halted() { [ -f "$HALT_FILE" ]; }
+clear_halt() { rm -f "$HALT_FILE" "$FAIL_FILE"; }
 
 # --- LaunchAgent entry point: boot once, then heal forever ------------------
 core_ok() {
@@ -186,16 +208,37 @@ core_ok() {
 }
 
 cmd_supervise() {
-  trap 'log "supervisor: TERM from launchd — leaving services as-is"' TERM
-  log "supervisor: booting stack (login/reload)"
-  # db_preflight failure exits 2 from cmd_start — also a nonzero exit for
-  # launchd to retry with ThrottleInterval backoff. Same net effect.
-  if ! cmd_start; then
-    log "supervisor: boot FAILED — exiting 1 so launchd retries"
-    exit 1
+  trap 'log "supervisor: TERM from launchd — leaving services as-is"; exit 0' TERM
+  # Halt gate (crash-loop guard): a previous run that hit
+  # MAX_CONSECUTIVE_FAILED_BOOTS left $HALT_FILE behind. Stay alive but idle
+  # — no boot attempts — until the marker is cleared (explicit
+  # start/restart/clear-halt). launchd KeepAlive relaunches this process on
+  # exit, so idling here is how a halted supervisor stays quiet instead of
+  # re-entering the boot storm every ThrottleInterval.
+  if supervisor_halted; then
+    log "supervisor: HALTED after ${MAX_CONSECUTIVE_FAILED_BOOTS} consecutive failed boots — idling (no healing). Run 'scripts/cluster.sh restart' or 'clear-halt' to resume"
+    while supervisor_halted; do sleep "$SUPERVISOR_INTERVAL"; done
+    log "supervisor: halt cleared — booting stack"
   fi
-  clear_pause
-  log "supervisor: watching every ${SUPERVISOR_INTERVAL}s (heal = idempotent boot)"
+  log "supervisor: booting stack (login/reload)"
+  # cmd_start now RETURNS failures instead of exiting, so a failing boot is
+  # countable here. (Previously a db-preflight failure exit-killed the whole
+  # supervisor and launchd just relaunched it — an uncountable loop.) The
+  # counter is seeded from disk so the streak survives supervisor restarts.
+  local boots=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) ))
+  while ! cmd_start; do
+    boots=$((boots + 1))
+    echo "$boots" > "$FAIL_FILE"
+    log "supervisor: boot FAILED ($boots/${MAX_CONSECUTIVE_FAILED_BOOTS} consecutive) — retrying in ${SUPERVISOR_INTERVAL}s"
+    if [ "$boots" -ge "$MAX_CONSECUTIVE_FAILED_BOOTS" ]; then
+      alert "Halted: ${boots} consecutive boot failures — healing stopped. Resume with: scripts/cluster.sh restart"
+      touch "$HALT_FILE"
+      log "supervisor: halt marker written ($HALT_FILE) — healing suspended to stop the crash loop"
+      exit 1   # nonzero for launchd; on relaunch the halt gate above idles
+    fi
+    sleep "$SUPERVISOR_INTERVAL"
+  done
+  log "supervisor: watching every ${SUPERVISOR_INTERVAL}s (heal = idempotent boot; guard halts after ${MAX_CONSECUTIVE_FAILED_BOOTS} consecutive failed boots)"
   while true; do
     if [ -f "$PAUSE_FILE" ]; then
       # Paused via a manual `cluster.sh stop`. Auto-resume after 10 min so a
@@ -211,7 +254,25 @@ cmd_supervise() {
     fi
     if ! core_ok; then
       log "supervisor: core service down — healing (idempotent boot)"
-      cmd_start >/dev/null 2>&1 || log "supervisor: heal attempt failed (retrying next tick)"
+      # Judge the heal by the stack's actual health, not cmd_start's exit:
+      # the boot is idempotent and can exit 0 with services still broken.
+      # --heal so the attempt doesn't clear the streak it's judged on.
+      if cmd_start --heal >/dev/null 2>&1 && core_ok; then
+        rm -f "$FAIL_FILE"   # healthy stack = failed streak over
+      else
+        local n=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" > "$FAIL_FILE"
+        if [ "$n" -ge "$MAX_CONSECUTIVE_FAILED_BOOTS" ]; then
+          alert "Halted: ${n} consecutive failed heals — healing stopped. Resume with: scripts/cluster.sh restart"
+          touch "$HALT_FILE"
+          log "supervisor: halt marker written — healing suspended; services left as-is"
+          exit 1
+        fi
+        log "supervisor: heal attempt failed ($n/${MAX_CONSECUTIVE_FAILED_BOOTS} consecutive) — retrying next tick"
+      fi
+    else
+      # Healthy tick: any failed-heal streak is over.
+      [ -f "$FAIL_FILE" ] && rm -f "$FAIL_FILE"
     fi
     sleep "$SUPERVISOR_INTERVAL"
   done
@@ -288,6 +349,7 @@ cmd_uninstall_agent() {
   fi
   if [ -f "$AGENT_PLIST" ]; then rm -f "$AGENT_PLIST"; ok "plist removed (no autostart at next login)"; fi
   clear_pause
+  clear_halt
   if [ "$keep" = "1" ]; then
     ok "services left running (--keep-running)"
   else
@@ -303,6 +365,9 @@ cmd_agent_status() {
     ok "LaunchAgent $AGENT_LABEL: LOADED (supervisor pid ${pid:-starting})"
     if [ -f "$PAUSE_FILE" ]; then
       warn "supervisor PAUSED (manual stop) — auto-resumes 10 min after pause, or run 'restart'"
+    fi
+    if supervisor_halted; then
+      warn "supervisor HALTED after repeated boot failures — healing stopped; run 'restart' or 'clear-halt' to resume"
     fi
   else
     warn "LaunchAgent $AGENT_LABEL: not loaded (install with 'install-agent')"
@@ -385,13 +450,28 @@ cmd_uninstall_app_agent() {
 }
 
 cmd_start() {
+  local heal=0
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --heal) heal=1 ;;   # supervisor-initiated heal: leave guard state alone
+      *) warn "unknown flag $arg ignored" ;;
+    esac
+  done
   log "booting Daisy cluster (boot order: T1 persistence → T2 ollama → T3 key → orchestrator)"
-  db_preflight || exit 2
+  db_preflight || return 2   # RETURN, not exit: the supervisor counts this failure; direct `start` still exits 2 via set -e
   tier2_preflight || true      # degraded-ok, never fatal
   tier3_preflight
   log "starting services (clusterctl)"
-  "$CTL" start --no-ui         # headless by default; pass --shell via args if you want the desktop shell
-  clear_pause # explicit start/restart = intent to run → the healer must watch again
+  "$CTL" start --no-ui || return $?   # headless by default; pass --shell via args if you want the desktop shell
+  # Explicit start/restart = intent to run → the healer must watch again, and
+  # a successful boot lifts any halt from the crash-loop guard. --heal SKIPS
+  # this: a supervisor-initiated heal must not reset the failure streak it is
+  # about to be judged on (that reset would make the guard never fire).
+  if [ "$heal" != "1" ]; then
+    rm -f "$FAIL_FILE"; clear_halt
+    clear_pause
+  fi
   log "boot complete — pins: T1 skillbase · T2 $TIER2_MODEL · T3 $TIER3_MODEL"
 }
 
@@ -437,6 +517,9 @@ cmd_status() {
   fi
   printf '  cascade          T1 skillbase($0) · T2 %s@%s [%s, model %s, %s] · T3 %s\n' \
     "$TIER2_MODEL" "$OLLAMA_BASE" "$ollama" "$model" "$residency" "$TIER3_MODEL"
+  if supervisor_halted; then
+    warn "supervisor HALTED: ${MAX_CONSECUTIVE_FAILED_BOOTS}+ consecutive failed boots — healing stopped; run 'restart' or 'clear-halt'"
+  fi
   if [ -f "$AGENT_PLIST" ] || launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
     cmd_agent_status
   fi
@@ -453,10 +536,10 @@ cmd_logs() {
 case "${1:-status}" in
   doctor)         cmd_doctor ;;
   start)          shift || true; cmd_start "$@" ;;
-  stop)           cmd_stop ;;
-  restart)        cmd_stop; sleep 1; cmd_start ;;
-  status)         cmd_status ;; # status already reports the agent line
-  supervise)      cmd_supervise ;;
+  stop)           cmd_stop ;;  restart)         clear_halt; cmd_stop; sleep 1; cmd_start ;;
+  status)          cmd_status ;; # status already reports the agent line
+  supervise)       cmd_supervise ;;
+  clear-halt)      clear_halt; log "halt cleared — healing resumes within ${SUPERVISOR_INTERVAL}s (if the supervisor is loaded)" ;;
   install-agent)  shift || true; cmd_install_agent "${1:-}" ;;
   uninstall-agent) shift || true; cmd_uninstall_agent "${1:-}" ;;
   install-app-agent) shift || true; cmd_install_app_agent "${1:-}" ;;
@@ -464,5 +547,5 @@ case "${1:-status}" in
   agent-status)   cmd_agent_status ;;
   task)           shift; "$CTL" task "$@" ;;
   logs)           shift || true; cmd_logs "${1:-all}" ;;
-  *) echo "usage: scripts/cluster.sh {doctor|start|stop|restart|status|supervise|install-agent|uninstall-agent|install-app-agent|uninstall-app-agent|agent-status|task '<json>'|logs [svc]}"; exit 2 ;;
+  *) echo "usage: scripts/cluster.sh {doctor|start|stop|restart|status|supervise|clear-halt|install-agent|uninstall-agent|install-app-agent|uninstall-app-agent|agent-status|task '<json>'|logs [svc]}"; exit 2 ;;
 esac

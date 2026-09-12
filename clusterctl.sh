@@ -230,6 +230,10 @@ clusterctl_doctor() {
     TIER3_MODEL="${TIER3_MODEL:-~anthropic/claude-sonnet-latest}"
     ENVFILE="${ENVFILE:-$ROOT/.env}"
     PAUSE_FILE="$ROOT/.run/supervisor.paused"
+    # Crash-loop guard state files (same contract as scripts/cluster.sh).
+    HALT_FILE="$ROOT/.run/supervisor.halted"
+    FAIL_FILE="$ROOT/.run/supervisor.bootfailures"
+    MAX_CONSECUTIVE_FAILED_BOOTS="${DAISY_MAX_BOOT_FAILURES:-5}"
     AGENT_LABEL="com.daisy.cluster"
     AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
     APP_AGENT_LABEL="com.daisy.cluster.app"

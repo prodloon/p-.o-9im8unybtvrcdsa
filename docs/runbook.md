@@ -33,6 +33,17 @@ Two agents, two jobs:
     (otherwise the healer would re-boot the stack within seconds);
     `start`/`restart` clear the pause immediately.
   - The supervisor itself is launchd-protected: kill it, launchd respawns it.
+  - **Crash-loop guard:** after 5 consecutive failed boots *or* heals
+    (`DAISY_MAX_BOOT_FAILURES` in `.env` to change), the supervisor HALTS —
+    macOS notification + `ALERT` line in `logs/launchd-agent.log` +
+    `.run/supervisor.halted` — and stops healing instead of crash-looping
+    forever. The streak counter lives in `.run/supervisor.bootfailures` and
+    survives supervisor restarts; one healthy tick clears it. A relaunched
+    supervisor sees the halt marker and idles (launchd would otherwise
+    respawn it straight back into the boot storm). Resume with
+    `./scripts/cluster.sh restart` (fix-then-reboot) or
+    `./scripts/cluster.sh clear-halt` (re-arm as-is); `status` and `doctor`
+    surface the halt and the live streak.
   - Healing covers orchestrator + telemetry (+ Ollama when the agent owns
     it) — the dashboard (vite) is a viewer and is not re-spawned.
 - `com.daisy.cluster.app` is RunAtLoad-only `/usr/bin/open '/Applications/
