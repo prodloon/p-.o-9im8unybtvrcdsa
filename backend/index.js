@@ -25,6 +25,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const { execSync } = require('child_process');
 const { Governor, POLICY: GOV_POLICY, readProcessStats } = require('../governor/governor');
 const { WorkerPool } = require('./worker-pool');
 const { SupervisorBridge } = require('./supervisor-bridge');
@@ -271,6 +272,38 @@ class Orchestrator {
     }
   }
 
+  /**
+   * Supervisor crash-loop guard state, read straight from the marker files
+   * scripts/cluster.sh maintains (single source of truth — the backend never
+   * writes guard state, it only observes). The pgrep is cached 5 s because
+   * this runs inside the 1 Hz telemetry path.
+   */
+  _supervisorGuard() {
+    const runDir = path.join(this.root, '.run');
+    const now = Date.now();
+    if (!this._supCheckAt || now - this._supCheckAt > 5000) {
+      try {
+        execSync('pgrep -f "scripts/cluster[.]sh supervise"', { stdio: 'ignore' });
+        this._supLoaded = true;
+      } catch {
+        this._supLoaded = false;
+      }
+      this._supCheckAt = now;
+    }
+    let streak = 0;
+    try {
+      streak = parseInt(fs.readFileSync(path.join(runDir, 'supervisor.bootfailures'), 'utf8').trim(), 10) || 0;
+    } catch {
+      streak = 0;
+    }
+    return {
+      loaded: this._supLoaded === true,
+      halted: fs.existsSync(path.join(runDir, 'supervisor.halted')),
+      streak,
+      maxFailures: 5, // scripts/cluster.sh MAX_CONSECUTIVE_FAILED_BOOTS default (DAISY_MAX_BOOT_FAILURES)
+    };
+  }
+
   telemetry() {
     const r = this.governor.ramReader();
     return {
@@ -302,6 +335,8 @@ class Orchestrator {
       // the number survives restarts and agrees with the DB.
       costs: this.costRollup(),
       workersHibernating: this.governor.db.prepare("SELECT COUNT(*) n FROM workers WHERE state='hibernating'").get().n,
+      // Supervisor healer + crash-loop guard (dashboard "Supervisor guard")
+      supervisor: this._supervisorGuard(),
     };
   }
 

@@ -261,6 +261,29 @@ export default function App() {
             <div className="flex justify-between"><span>Hibernating workers</span><span className="font-mono">{sample?.workersHibernating ?? 0}</span></div>
           </div>
         </div>
+        <div className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4">
+          <div className="mb-1 text-xs font-medium uppercase tracking-wider text-slate-400">Supervisor guard</div>
+          <div className="space-y-1 text-sm text-slate-300">
+            <div className="flex justify-between">
+              <span>Healer</span>
+              <span className={sample?.supervisor?.loaded ? 'text-emerald-400' : 'text-amber-400'}>
+                {sample?.supervisor?.loaded ? 'watching' : 'not running'}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>Boot-failure streak</span>
+              <span className={`font-mono ${(sample?.supervisor?.streak ?? 0) > 0 ? 'text-amber-400' : 'text-slate-400'}`}>
+                {sample?.supervisor?.streak ?? 0} / {sample?.supervisor?.maxFailures ?? 5}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>Halt</span>
+              <span className={sample?.supervisor?.halted ? 'text-rose-400' : 'text-emerald-400'}>
+                {sample?.supervisor?.halted ? 'HALTED — healing stopped' : 'clear'}
+              </span>
+            </div>
+          </div>
+        </div>
         <CascadePanel cascade={sample?.cascade} costs={sample?.costs} />
       </div>
 

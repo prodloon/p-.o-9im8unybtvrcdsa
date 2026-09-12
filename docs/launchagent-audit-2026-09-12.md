@@ -137,3 +137,54 @@ resurrecting agents (§1), 4 plain login autostarts (§2), 4 scheduled (§3),
 2 classic Login Items (§8.1), 1 BTM-allowed app login item (Daisy Cluster,
 §8.2) — and a pile of blocked/disabled leftovers that cannot run. Nothing
 auto-starts from vectors outside this list.
+
+## 9. Second-pass purge + continuous monitoring (later the same day)
+
+### 9.1 BTM-blocked / orphaned plists purged
+
+Deletion required the owning app to be ABSENT (an installed app keeps its
+updater):
+
+- ❌ `io.sideloadly.daemon` — booted out + plist deleted (Sideloadly.app absent,
+  BTM-disallowed, explains the last-exit 78 loop)
+- ❌ `org.virtualbox.vboxwebsrv` — plist deleted (VirtualBox.app absent)
+- ❌ `/Library/LaunchAgents/com.enigmasoft.spyhunter.plist` — deleted via admin
+  (SpyHunter.app absent, BTM-disallowed)
+- ❌ `/Library/LaunchAgents/com.paceap.eden.licensed.agent.plist` — deleted via
+  admin (completes the PACE removal; iLok stack BTM-disallowed)
+- ✅ KEPT `com.starstechnologies.updaterhelper.plist` — owner
+  **PokerStars.app is installed**; BTM blocks it, but deleting an updater for
+  present software would break its update path. Revisit if PokerStars goes.
+- ✅ KEPT Docker helpers (`com.docker.socket`, `com.docker.vmnetd`) and
+  Ollama's in-bundle Squirrel updater — owning apps installed; removal belongs
+  to uninstalling those apps.
+
+### 9.2 Supervisor guard state on the dashboard
+
+`backend/index.js` telemetry now carries a `supervisor` block (healer loaded,
+halt marker, boot-failure streak vs max) read directly from the
+`.run/supervisor.*` state files scripts/cluster.sh maintains — the dashboard
+renders it in a new "Supervisor guard" panel (ui/src/App.jsx). Verified live:
+streak planted in the file appeared in telemetry within one write cycle.
+
+### 9.3 Weekly drift alarm
+
+- `~/bin/launchagent-drift-check` (also on PATH) — snapshots the full surface
+  (all plist dirs + keys, loaded labels, disabled overrides, app-bundle
+  helpers, Login Items) and diffs against
+  `~/.config/launchagent-baseline.json`. Exit 1 = drift.
+- `com.moses.la-drift` LaunchAgent — Sundays 10:00, `--notify` mode (macOS
+  notification on drift), log at `~/Library/Logs/launchagent-drift.log`.
+- First run immediately caught a real flip
+  (`com.apple.FolderActionsDispatcher` disabled→enabled since the morning
+  audit) and the planted test decoy during validation. Baseline refreshed to
+  current state (including this drift agent itself — a new, intentional
+  autostart vector).
+- The diff also tracks **daisy guard state** (`daisyGuard` key: halt marker
+  + streak from `~/daisy-chain/.run/`), so a weekly report surfaces guard
+  trips, not just plist churn: `DAISY GUARD: supervisor HALTED — healing
+  stopped` / `boot-failure streak rose N -> M`. Verified with planted streak
+  and halt markers (all five runs passed).
+
+Baseline refresh procedure after INTENTIONAL changes:
+`launchagent-drift-check --update-baseline`
