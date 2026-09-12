@@ -24,3 +24,4 @@ ui/dist/
 
 # macOS
 .DS_Store
+database/*.tmp
