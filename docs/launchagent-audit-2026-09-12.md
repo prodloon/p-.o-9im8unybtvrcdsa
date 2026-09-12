@@ -185,6 +185,19 @@ streak planted in the file appeared in telemetry within one write cycle.
   trips, not just plist churn: `DAISY GUARD: supervisor HALTED — healing
   stopped` / `boot-failure streak rose N -> M`. Verified with planted streak
   and halt markers (all five runs passed).
+- Also watches the **supervisor log timestamp era** (`daisyLog` key) so a
+  reverted `cluster.sh` gets flagged: (a) `scripts/cluster.sh` lost the
+  timestamped `log()` — a revert/bad merge silently degrades the dashboard
+  events strip to unknown times; (b) newest tagged log line is
+  pre-timestamping format while timestamped lines exist — a legacy-format
+  writer is ACTIVE (running supervisor predates the fix; restart the
+  launchd agent to load new code). These checks are ABSOLUTE — evaluated
+  every run against the known-good format, so `--update-baseline` cannot
+  silence them. Sandboxed testing uses `DAISY_ROOT=<dir>` and automatically
+  redirects the baseline to `launchagent-baseline-sandbox.json` so tests
+  can never pollute the real baseline (a pollution bug this change both
+  caused and fixed). A failed diff subprocess now exits 2 (`UNVERIFIED`)
+  instead of silently reading as "no drift".
 
 Baseline refresh procedure after INTENTIONAL changes:
 `launchagent-drift-check --update-baseline`
