@@ -16,7 +16,11 @@
 #   scripts/cluster.sh install-agent [--unload-first]   write + load the
 #                               LaunchAgent (login autostart + self-heal)
 #   scripts/cluster.sh uninstall-agent [--keep-running] remove the agent
-#   scripts/cluster.sh agent-status         loaded/running + last heal action
+#   scripts/cluster.sh install-app-agent [--unload-first]   login-autostart
+#                               for the INSTALLED app (RunAtLoad `open`;
+#                               no KeepAlive — the app stays user-closable)
+#   scripts/cluster.sh uninstall-app-agent  remove the app autostart
+#   scripts/cluster.sh agent-status         both agents: loaded/running
 #   scripts/cluster.sh task '<json>'   enqueue work through the running stack
 #   scripts/cluster.sh logs [svc]      orchestrator|telemetry|ollama|all
 #
@@ -39,8 +43,11 @@ ENVFILE="$ROOT/.env"
 OLLAMA_BASE="http://localhost:11434"            # PINNED tier-2 host (§5.5)
 TIER2_MODEL="qwen2.5:7b"                        # PINNED tier-2 model (§5.5)
 TIER3_MODEL="~anthropic/claude-sonnet-latest"   # PINNED tier-3 model (§5.5)
-AGENT_LABEL="com.daisy.cluster"                 # LaunchAgent identifier
+AGENT_LABEL="com.daisy.cluster"                 # LaunchAgent identifier (repo supervisor)
 AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+APP_AGENT_LABEL="com.daisy.cluster.app"         # LaunchAgent: open the installed app at login
+APP_AGENT_PLIST="$HOME/Library/LaunchAgents/$APP_AGENT_LABEL.plist"
+APP_BUNDLE="/Applications/Daisy Cluster.app"
 SUPERVISOR_INTERVAL=15                           # heal-check cadence (s)
 PAUSE_FILE="$ROOT/.run/supervisor.paused"
 WARM_TIER2="${DAISY_WARM_TIER2:-1}"             # default ON: pre-load qwen weights at boot (removes the ~20s cold start on first consult)
@@ -289,6 +296,7 @@ cmd_uninstall_agent() {
 }
 
 cmd_agent_status() {
+  # Repo supervisor agent
   if launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
     local pid
     pid=$(launchctl print "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null | sed -n 's/^[[:space:]]*pid = //p' | head -1)
@@ -299,6 +307,81 @@ cmd_agent_status() {
   else
     warn "LaunchAgent $AGENT_LABEL: not loaded (install with 'install-agent')"
   fi
+  # Installed-app autostart agent
+  if launchctl print "gui/$(id -u)/$APP_AGENT_LABEL" >/dev/null 2>&1; then
+    ok "LaunchAgent $APP_AGENT_LABEL: LOADED (opens $APP_BUNDLE at login)"
+  else
+    warn "LaunchAgent $APP_AGENT_LABEL: not loaded (install with 'install-app-agent')"
+  fi
+}
+
+# --- Installed-app login autostart ------------------------------------------
+# RunAtLoad ONLY — a GUI app must stay user-closable, and `open` exits
+# immediately, so KeepAlive here would just spawn-loop. The app's own
+# single-instance guard makes double-launch harmless.
+write_app_agent_plist() {
+  cat > "$APP_AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${APP_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/open</string>
+    <string>${APP_BUNDLE}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PLIST
+}
+
+agent_loaded() { launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; }
+agent_pid() { launchctl print "gui/$(id -u)/$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = //p' | head -1; }
+load_agent() { launchctl bootstrap "gui/$(id -u)" "$2" 2>/dev/null; }
+unload_agent() { launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true; }
+
+cmd_install_app_agent() {
+  local unload_first=0
+  [ "${1:-}" = "--unload-first" ] && unload_first=1
+  [ -d "$APP_BUNDLE" ] || { fail "$APP_BUNDLE not installed — run ./make-installer.sh first"; exit 2; }
+  mkdir -p "$HOME/Library/LaunchAgents"
+  if agent_loaded "$APP_AGENT_LABEL"; then
+    if [ "$unload_first" = "1" ]; then
+      log "app agent already loaded — unloading first (--unload-first)"
+      unload_agent "$APP_AGENT_LABEL"
+    else
+      log "app agent already loaded — nothing to do (use --unload-first to reload)"
+      cmd_agent_status
+      return 0
+    fi
+  fi
+  log "writing $APP_AGENT_PLIST"
+  write_app_agent_plist
+  if ! plutil -lint "$APP_AGENT_PLIST" >/dev/null; then fail "generated plist failed lint"; exit 2; fi
+  ok "plist lint passed"
+  log "loading app agent (bootstrap gui/$(id -u)) — RunAtLoad will open the app now"
+  if ! load_agent "$APP_AGENT_LABEL" "$APP_AGENT_PLIST"; then
+    fail "bootstrap failed"
+    exit 2
+  fi
+  sleep 4
+  cmd_agent_status
+  log "installed app is login-autostart — close it any time; it returns at next login"
+}
+
+cmd_uninstall_app_agent() {
+  if agent_loaded "$APP_AGENT_LABEL"; then
+    log "booting out app agent (does NOT quit a running app)"
+    unload_agent "$APP_AGENT_LABEL"
+    ok "app autostart removed"
+  else
+    log "app agent not loaded"
+  fi
+  [ -f "$APP_AGENT_PLIST" ] && rm -f "$APP_AGENT_PLIST" && ok "app plist removed"
+  :
 }
 
 cmd_start() {
@@ -337,6 +420,12 @@ cmd_stop() {
   log "stop complete"
 }
 
+# Load doctor function from external script (clean separation)
+if [ -f "$ROOT/scripts/cluster_doctor.sh" ]; then
+  # shellcheck source=cluster_doctor.sh
+  . "$ROOT/scripts/cluster_doctor.sh"
+fi
+
 cmd_status() {
   "$CTL" status || true
   # Cascade pin + tier-2 health summary (machine-readable companion to status).
@@ -362,6 +451,7 @@ cmd_logs() {
 }
 
 case "${1:-status}" in
+  doctor)         cmd_doctor ;;
   start)          shift || true; cmd_start "$@" ;;
   stop)           cmd_stop ;;
   restart)        cmd_stop; sleep 1; cmd_start ;;
@@ -369,8 +459,10 @@ case "${1:-status}" in
   supervise)      cmd_supervise ;;
   install-agent)  shift || true; cmd_install_agent "${1:-}" ;;
   uninstall-agent) shift || true; cmd_uninstall_agent "${1:-}" ;;
+  install-app-agent) shift || true; cmd_install_app_agent "${1:-}" ;;
+  uninstall-app-agent) cmd_uninstall_app_agent ;;
   agent-status)   cmd_agent_status ;;
   task)           shift; "$CTL" task "$@" ;;
   logs)           shift || true; cmd_logs "${1:-all}" ;;
-  *) echo "usage: scripts/cluster.sh {start|stop|restart|status|supervise|install-agent|uninstall-agent|agent-status|task '<json>'|logs [svc]}"; exit 2 ;;
+  *) echo "usage: scripts/cluster.sh {doctor|start|stop|restart|status|supervise|install-agent|uninstall-agent|install-app-agent|uninstall-app-agent|agent-status|task '<json>'|logs [svc]}"; exit 2 ;;
 esac

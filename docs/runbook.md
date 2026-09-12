@@ -21,18 +21,25 @@ Architecture and session history live in `knowledge.md`; this file is the
 ```bash
 cd ~/daisy-chain
 ./scripts/cluster.sh install-agent      # once — survives reboots, heals crashes
-./scripts/cluster.sh uninstall-agent    # remove it (stops services unless --keep-running)
+./scripts/cluster.sh install-app-agent  # once — opens the installed app at login
+./scripts/cluster.sh uninstall-agent    # remove supervisor (stops services unless --keep-running)
+./scripts/cluster.sh uninstall-app-agent # remove app autostart (never quits a running app)
 ```
-The agent runs `scripts/cluster.sh supervise`: boot at login, then a 15 s
-watchdog that re-runs the (idempotent) boot when a core service dies.
-Consequences you should know:
-- `./scripts/cluster.sh stop` **pauses the supervisor for 10 min** (otherwise
-  the healer would re-boot the stack within seconds). Auto-resumes after;
-  `start`/`restart` clear the pause immediately.
-- The supervisor itself is launchd-protected: kill it and launchd respawns it.
-- Healing covers orchestrator + telemetry (+ Ollama when the agent owns it)
-  — the dashboard (vite) is a viewer and is not re-spawned by the healer.
-- Logs: `logs/launchd-agent.log` (supervisor) — status shows the agent line.
+Two agents, two jobs:
+- `com.daisy.cluster` runs `scripts/cluster.sh supervise`: boot the repo
+  stack at login, then a 15 s watchdog re-runs the (idempotent) boot when a
+  core service dies. Consequences:
+  - `./scripts/cluster.sh stop` **pauses the supervisor for 10 min**
+    (otherwise the healer would re-boot the stack within seconds);
+    `start`/`restart` clear the pause immediately.
+  - The supervisor itself is launchd-protected: kill it, launchd respawns it.
+  - Healing covers orchestrator + telemetry (+ Ollama when the agent owns
+    it) — the dashboard (vite) is a viewer and is not re-spawned.
+- `com.daisy.cluster.app` is RunAtLoad-only `/usr/bin/open '/Applications/
+  Daisy Cluster.app'` at login — deliberately **no KeepAlive** (a GUI app
+  stays user-closable; `open` exits instantly, so KeepAlive would loop).
+  The app's single-instance guard makes double-launch harmless.
+- Logs: `logs/launchd-agent.log` (supervisor) — status shows both agent lines.
 
 **One command — the whole stack** (manual control):
 ```bash
@@ -210,6 +217,11 @@ Layout:
 - **Secrets:** `~/Library/Application Support/DaisyCluster/.env` — put
   `OPENROUTER_API_KEY=…` there; the shell loads it at backend spawn.
 - **A DMG** for sharing lands in `src-tauri/target/release/bundle/dmg/`.
+- **Login autostart:** `./scripts/cluster.sh install-app-agent` opens the
+  app at every login (RunAtLoad only — close it freely; it returns next
+  login). The shell kills its backend on window close AND on app exit, and
+  the backend carries its own orphan guard (exits when reparented to pid 1),
+  so no duplicate-orchestrator orphans survive any quit path.
 
 The installed app and the repo stack are INDEPENDENT (separate data dirs,
 separate queues). `clusterctl` manages the repo stack only and shows the
