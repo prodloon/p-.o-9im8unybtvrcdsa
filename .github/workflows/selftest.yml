@@ -1,0 +1,110 @@
+name: selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# The python battery is darwin-shaped end to end (launchctl in suite 7, BSD
+# stat, a python spawner using start_new_session) and pins /usr/local/bin/node,
+# so the runner must be macOS. Homebrew node is symlinked to that path rather
+# than fighting the pin.
+#
+# ui/dist is gitignored but suite 5 asserts it, so CI runs the vite build
+# first. Suite 5's cargo check gets a 600 s window inside the battery, so the
+# Rust cache is warmed by an explicit cargo check before it runs.
+#
+# Suite 7 asserts "status exits 0 when the stack is up", so CI boots the real
+# stack headless (--no-ui: orchestrator + telemetry-server only — no tauri
+# shell, no cargo build, no vite).
+#
+# No OPENROUTER_API_KEY needed: suite 2 blanks it by design and suite 3's
+# end-to-end task is file-io.
+
+jobs:
+  selftest:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show preinstalled toolchain
+        run: |
+          node --version; python3 --version; cargo --version; bash --version | head -1
+
+      - name: Set up Node (>=26 for node:sqlite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Pin node at /usr/local/bin/node (battery + clusterctl hardcode it)
+        run: |
+          set -euo pipefail
+          NODE_BIN="$(command -v node)"
+          echo "using node: $("$NODE_BIN" --version) at $NODE_BIN"
+          sudo mkdir -p /usr/local/bin
+          if [ -e /usr/local/bin/node ] && [ ! -L /usr/local/bin/node ]; then
+            sudo mv /usr/local/bin/node /usr/local/bin/node.pre-daisy
+          fi
+          sudo ln -sf "$NODE_BIN" /usr/local/bin/node
+          /usr/local/bin/node --version
+
+      # macOS runners don't ship cargo preinstalled.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Suite 5 asserts ui/dist exists and contains a production build; it is
+      # gitignored, so build it here. Lockfile (ui/package-lock.json) is tracked.
+      - name: Build dashboard (ui/dist)
+        run: |
+          cd ui
+          npm ci --no-audit --no-fund
+          npm run build
+
+      # Suite 5 runs `cargo check` with a 600 s timeout inside the battery —
+      # warm the cache in the same target dir the battery will use. Cache
+      # keyed on Cargo.lock + crates.
+      - name: Warm cargo cache (suite 5 has a 600 s timeout)
+        run: cargo check
+        working-directory: src-tauri
+        timeout-minutes: 20
+
+      - name: Suite 1+2 — node batteries (governor + backend)
+        run: |
+          node governor/governor.selftest.js
+          node backend/backend.selftest.js
+
+      - name: Boot real stack headless (suite 3 + 4 + 7 drive it)
+        run: |
+          ./clusterctl.sh start --no-ui
+          ./clusterctl.sh status
+
+      - name: Suite 3-8 — python end-to-end battery
+        run: python3 daisy_cluster_selftest.py
+
+      - name: Tear down stack
+        if: always()
+        run: ./clusterctl.sh stop
+
+      - name: Summarize failures
+        if: failure()
+        run: |
+          echo "::group::orchestrator.log (tail)"
+          tail -50 logs/orchestrator.log 2>/dev/null || echo "(no orchestrator.log)"
+          echo "::endgroup::"
+          echo "::group::telemetry.log (tail)"
+          tail -50 logs/telemetry.log 2>/dev/null || echo "(no telemetry.log)"
+          echo "::endgroup::"
