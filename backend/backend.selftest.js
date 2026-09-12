@@ -224,6 +224,23 @@ async function main() {
     check('chain is exactly [TIER3] — no cloud fallback model', pinned.modelChain.length === 1 && pinned.modelChain[0] === POLICY.TIER3_MODEL);
     check('tier2 mapping is the pinned ollama constant', pinned.tier2 === null || (pinned.tier2.model === 'qwen2.5:7b' && pinned.tier2.url === 'http://localhost:11434/api/chat'));
 
+    // Tier-2 request shape: the residency policy rides on EVERY consult.
+    let t2body = null;
+    const t2bridge = new SupervisorBridge({
+      apiKey: 'test-key',
+      fetchImpl: async (url, opts) => {
+        if (String(url).includes('11434')) {
+          t2body = JSON.parse(opts.body);
+          return { ok: true, status: 200, json: async () => ({ message: { content: '{"verdict":"delegate","skill":"api-route-map","confidence":0.8,"inject":true}' } }) };
+        }
+        return openRouterResponse('{"verdict":"reject"}');
+      },
+      sleep: async () => {},
+    });
+    check('tier2 residency defaults to keep_alive=-1, numeric (weights resident)', t2bridge.tier2.keepAlive === POLICY.OLLAMA_KEEP_ALIVE && POLICY.OLLAMA_KEEP_ALIVE === -1);
+    const t2res = await t2bridge.routeTask(t2bridge.buildRequestPayload({ workerId: 'w', taskKind: 'k', taskSummary: 'no template ever hits this triage request', skillsCatalog: ['api-route-map'] }), []);
+    check('tier-2 consult pins model resident (numeric keep_alive in body)', t2res.source === 'tier2-local' && !!t2body && t2body.model === POLICY.TIER2_OLLAMA_MODEL && t2body.keep_alive === -1, JSON.stringify(t2body));
+
     // Exclusive T3: 429s exhaust → clean failure (no llama fallback to save it).
     const calls = [];
     const bridge = new SupervisorBridge({

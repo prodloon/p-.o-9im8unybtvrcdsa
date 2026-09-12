@@ -31,6 +31,19 @@ const POLICY = {
   TIER2_OLLAMA_MODEL: 'qwen2.5:7b', // PINNED — no env override
   OLLAMA_URL: 'http://localhost:11434/api/chat', // PINNED — no env override
   OLLAMA_TIMEOUT_MS: Number(process.env.DAISY_OLLAMA_TIMEOUT_MS) || 120_000, // generous: covers cold start
+  // Residency policy: pin qwen weights in RAM so tier-2 consults skip the
+  // 4-5 GB cold load (~20s+ on this box). -1 (JSON number) = resident
+  // forever. GOTCHA (Ollama 0.33.3): keep_alive is parsed as a Go duration
+  // — the STRING "-1" is rejected (400), only numeric -1/0 or duration
+  // strings like '5m' are legal. DAISY_OLLAMA_KEEP_ALIVE: '-1' | '0' |
+  // '5m' — the governor cannot evict pinned weights, so set a duration if
+  // the box needs the RAM back.
+  OLLAMA_KEEP_ALIVE: (() => {
+    const raw = process.env.DAISY_OLLAMA_KEEP_ALIVE;
+    if (raw === undefined || raw === '') return -1;
+    if (raw === '-1' || raw === '0') return Number(raw); // numeric-only sentinels
+    return raw; // duration string, e.g. '5m'
+  })(),
   OLLAMA_MAX_TOKENS: 220,
   // Tier 3: frontier brain via OpenRouter — exclusive, no cloud fallback
   TIER3_MODEL: '~anthropic/claude-sonnet-latest', // PINNED — live-verified alias, no env override
@@ -85,11 +98,17 @@ class SupervisorBridge {
         model: POLICY.TIER2_OLLAMA_MODEL,
         timeoutMs: POLICY.OLLAMA_TIMEOUT_MS,
         maxTokens: POLICY.OLLAMA_MAX_TOKENS,
+        keepAlive: POLICY.OLLAMA_KEEP_ALIVE,
       };
     } else {
       this.tier2 = opts.tier2;
-      if (this.tier2 && (this.tier2.model !== POLICY.TIER2_OLLAMA_MODEL || !String(this.tier2.url || '').startsWith('http://localhost:11434'))) {
-        throw new Error(`supervisor-bridge: tier2 mapping override rejected — permanently pinned to ${POLICY.TIER2_OLLAMA_MODEL} @ http://localhost:11434 (knowledge.md §5.5)`);
+      if (this.tier2) {
+        // Residency policy applies even to injected tier-2 objects (tests);
+        // mapping fields stay permanently pinned and validated below.
+        this.tier2.keepAlive = this.tier2.keepAlive !== undefined ? this.tier2.keepAlive : POLICY.OLLAMA_KEEP_ALIVE;
+        if (this.tier2.model !== POLICY.TIER2_OLLAMA_MODEL || !String(this.tier2.url || '').startsWith('http://localhost:11434')) {
+          throw new Error(`supervisor-bridge: tier2 mapping override rejected — permanently pinned to ${POLICY.TIER2_OLLAMA_MODEL} @ http://localhost:11434 (knowledge.md §5.5)`);
+        }
       }
     }
     if (!this.apiKey) {
@@ -221,6 +240,7 @@ class SupervisorBridge {
           ],
           stream: false,
           format: 'json',
+          keep_alive: t2.keepAlive, // re-pin residency on every consult
           options: { temperature: 0.2, num_predict: t2.maxTokens },
         }),
         signal: AbortSignal.timeout(t2.timeoutMs),

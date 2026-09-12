@@ -129,8 +129,15 @@ Live-routing cheat sheet (all three verified in production):
 Tier-2/3 mappings are **PERMANENT** (knowledge.md §5.5): T2 =
 `qwen2.5:7b` @ `http://localhost:11434`, T3 =
 `~anthropic/claude-sonnet-latest` exclusively (no cloud fallback). Only
-`DAISY_OLLAMA_TIMEOUT_MS` (default 120 s) and `DAISY_WARM_TIER2=1`
-(pre-load Ollama weights at boot) are tunable. The full
+`DAISY_OLLAMA_TIMEOUT_MS` (default 120 s), `DAISY_WARM_TIER2=0` (disable
+the default boot warm-up), and `DAISY_OLLAMA_KEEP_ALIVE` (`-1` resident
+forever · `0` free after each consult · `'5m'` duration) are tunable.
+Residency GOTCHA: Ollama parses `keep_alive` as a Go duration — the
+STRING `"-1"` is rejected (400); numeric `-1` is the forever sentinel.
+Honest numbers on the 16 GB dev box: warm ping 0.6s with residency
+(was 120s+ cold), but a consult still takes 17s (uncontended) to ~55s
+(orchestrator tick load contending) — CPU generation is 1–2.3 tok/s.
+The full
 contract lives in `knowledge.md` §5.5 — the COST LAW. Boot-order checks
 (db/WAL → Ollama → key → orchestrator) are automated in `scripts/cluster.sh`.
 - **Quick introspection:**

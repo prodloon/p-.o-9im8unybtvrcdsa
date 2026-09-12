@@ -30,7 +30,15 @@ ENVFILE="$ROOT/.env"
 OLLAMA_BASE="http://localhost:11434"            # PINNED tier-2 host (§5.5)
 TIER2_MODEL="qwen2.5:7b"                        # PINNED tier-2 model (§5.5)
 TIER3_MODEL="~anthropic/claude-sonnet-latest"   # PINNED tier-3 model (§5.5)
-WARM_TIER2="${DAISY_WARM_TIER2:-0}"             # 1 = pre-load qwen weights (slow but removes first-consult cold start)
+WARM_TIER2="${DAISY_WARM_TIER2:-1}"             # default ON: pre-load qwen weights at boot (removes the ~20s cold start on first consult)
+# Residency policy — MUST match bridge POLICY.OLLAMA_KEEP_ALIVE. GOTCHA:
+# Ollama parses keep_alive as a Go duration; the STRING "-1" is rejected
+# (400). Numeric -1 = resident forever, '5m' = release after 5 min.
+case "${DAISY_OLLAMA_KEEP_ALIVE:-}" in
+  '')       KEEP_ALIVE_JSON=-1 ;;
+  '-1'|'0') KEEP_ALIVE_JSON="${DAISY_OLLAMA_KEEP_ALIVE}" ;;
+  *)        KEEP_ALIVE_JSON="\"${DAISY_OLLAMA_KEEP_ALIVE}\"" ;; # duration string → quoted
+esac
 OLLAMA_PIDFILE="$ROOT/.run/ollama.pid"
 
 # API key into env for checks (never printed) — clusterctl does the same for spawns.
@@ -117,12 +125,13 @@ PY
   fi
 
   if [ "$WARM_TIER2" = "1" ]; then
-    log "tier 2: warming weights (DAISY_WARM_TIER2=1)"
-    curl -sf -m 300 "$OLLAMA_BASE/api/chat" -d "{\"model\":\"$TIER2_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"stream\":false,\"options\":{\"num_predict\":1}}" >/dev/null 2>&1 \
+    log "tier 2: warming weights (keep_alive=$(echo $KEEP_ALIVE_JSON | tr -d '\\"'); disable with DAISY_WARM_TIER2=0)"
+    # Warm call pins residency the same way every tier-2 consult does.
+    curl -sf -m 300 "$OLLAMA_BASE/api/chat" -d "{\"model\":\"$TIER2_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"stream\":false,\"keep_alive\":$KEEP_ALIVE_JSON,\"options\":{\"num_predict\":1}}" >/dev/null 2>&1 \
       && ok "weights resident — first consult will be fast" \
       || warn "warmup call failed (continuing; first consult pays the cold start)"
   else
-    ok "cold-start acceptable (set DAISY_WARM_TIER2=1 to pre-load weights)"
+    warn "warmup disabled (DAISY_WARM_TIER2=0) — first tier-2 consult pays the cold start"
   fi
 }
 
@@ -169,11 +178,14 @@ cmd_stop() {
 cmd_status() {
   "$CTL" status || true
   # Cascade pin + tier-2 health summary (machine-readable companion to status).
-  local ollama="down" model="missing"
+  local ollama="down" model="missing" residency="not loaded"
   ollama_healthy && ollama="up"
   model_pulled && model="present"
-  printf '  cascade          T1 skillbase($0) · T2 %s@%s [%s, model %s] · T3 %s\n' \
-    "$TIER2_MODEL" "$OLLAMA_BASE" "$ollama" "$model" "$TIER3_MODEL"
+  if ollama_healthy && curl -sf -m 5 "$OLLAMA_BASE/api/ps" 2>/dev/null | grep -q "\"name\":\"$TIER2_MODEL"; then
+    residency="resident (keep_alive=$(echo $KEEP_ALIVE_JSON | tr -d '\\"'))"
+  fi
+  printf '  cascade          T1 skillbase($0) · T2 %s@%s [%s, model %s, %s] · T3 %s\n' \
+    "$TIER2_MODEL" "$OLLAMA_BASE" "$ollama" "$model" "$residency" "$TIER3_MODEL"
 }
 
 cmd_logs() {
