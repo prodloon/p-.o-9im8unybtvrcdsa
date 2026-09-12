@@ -63,6 +63,16 @@ shell_pid()    {
   done
 }
 installed_shell_pid() { pgrep -x "daisy-cluster" | while read -r p; do case "$(ps -o command= -p "$p" 2>/dev/null)" in *"Daisy Cluster.app"*) echo "$p";; esac; done | head -1; }
+app_backend_pid() {
+  # The installed app's backend: --serve running from inside the bundle.
+  local p
+  for p in $(pgrep -f "backend/index[.]js --serve"); do
+    case "$(ps -o command= -p "$p" 2>/dev/null)" in
+      *"Daisy Cluster.app"*) echo "$p"; return ;;
+    esac
+  done
+  return 1
+}
 alive()        { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
 shell_is_up() { alive "$(shell_pid)"; }
@@ -211,6 +221,7 @@ cmd_stop() {
 cmd_status() {
   local rc=0
   echo "Daisy cluster status — $(date '+%H:%M:%S')"
+  echo "  ── REPO STACK — ~/daisy-chain (managed by clusterctl + launchd agent) ──"
   printf "  %-18s %-8s %s\n" "SERVICE" "PID" "HEALTH"
 
   local o="$(orch_pid)" t="$(telemetry_pid)" v="$(vite_pid)" s="$(shell_pid)"
@@ -232,16 +243,56 @@ cmd_status() {
   fi
   if alive "$s"; then printf "  %-18s %-8s %s✓ up%s\n" "shell" "$s" "$c_green" "$c_off"
   else printf "  %-18s %-8s %s— not running%s\n" "shell" "-" "$c_dim" "$c_off"; fi
-  local inst
-  inst=$(installed_shell_pid)
-  if alive "$inst"; then
-    note "installed app: /Applications/Daisy Cluster.app running (pid $inst) — owns its own backend"
+
+  # LaunchAgent supervisor (repo stack only — never manages the installed app).
+  local sup="$(pgrep -f "scripts/cluster[.]sh supervise" 2>/dev/null | head -1)"
+  if alive "$sup"; then
+    local sup_note="✓ watching (heals core every 15s)"
+    if [ -f "$ROOT/.run/supervisor.paused" ]; then
+      sup_note="! PAUSED (manual stop; auto-resumes 10 min)"
+    fi
+    printf "  %-18s %-8s %s%s%s\n" "supervisor-agent" "$sup" "$c_green" "$sup_note" "$c_off"
+  else
+    printf "  %-18s %-8s %s— not running (install: scripts/cluster.sh install-agent)%s\n" "supervisor-agent" "-" "$c_dim" "$c_off"
   fi
 
-  # live telemetry glance
+  # live telemetry glance (repo stack)
   local tel
   tel=$(curl -sf -m 2 "http://127.0.0.1:$TELEMETRY_PORT/api/telemetry" 2>/dev/null) && \
-    echo "$tel" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d);console.log('  live: cycle '+t.cycle+' · ram '+t.ramPct+'% · agents '+(t.pool?t.pool.size:'?')+' · queue pending '+(t.queue?t.queue.pending:'?'))}catch{}})" 2>/dev/null
+    echo "$tel" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d);console.log('  live: cycle '+t.cycle+' · ram '+t.ramPct+'% · agents '+(t.pool?t.pool.size:'?')+' · queue pending '+(t.queue?t.queue.pending:'?')+' · data database/')}catch{}})" 2>/dev/null
+
+  # ── INSTALLED APP — a second, fully independent runtime ─────────────────
+  # Separate code (bundle payload), separate data (Application Support),
+  # separate queue + key + cascade. clusterctl NEVER manages it.
+  echo "  ── INSTALLED APP — /Applications/Daisy Cluster.app (independent) ──"
+  local inst="$(installed_shell_pid)"
+  local appdb="$HOME/Library/Application Support/DaisyCluster/database"
+  if alive "$inst"; then
+    printf "  %-18s %-8s %s✓ up%s\n" "app-shell" "$inst" "$c_green" "$c_off"
+  else
+    printf "  %-18s %-8s %s— not running (open the app to start it)%s\n" "app-shell" "-" "$c_dim" "$c_off"
+  fi
+  local aorch
+  aorch=$(app_backend_pid)
+  if alive "$aorch"; then
+    printf "  %-18s %-8s %s✓ up%s · data 'Application Support/DaisyCluster'\n" "app-backend" "$aorch" "$c_green" "$c_off"
+  elif alive "$inst"; then
+    printf "  %-18s %-8s %s! shell up but backend missing%s\n" "app-backend" "-" "$c_amber" "$c_off"
+  else
+    printf "  %-18s %-8s %s—%s\n" "app-backend" "-" "$c_dim" "$c_off"
+  fi
+  # App telemetry freshness (its own file, its own clock) — informational.
+  if [ -f "$appdb/telemetry.json" ]; then
+    local age
+    age=$("$NODE_BIN" -e "console.log(Math.max(0,Math.round((Date.now()-require('fs').statSync(process.argv[1]).mtimeMs)/1000)))" "$appdb/telemetry.json" 2>/dev/null || echo '?')
+    if [ "$age" != '?' ] && [ "$age" -lt 10 ]; then
+      printf "  %-18s %-8s %stelemetry FRESH (%ss ago)%s\n" "app-telemetry" "-" "$c_green" "$age" "$c_off"
+    else
+      printf "  %-18s %-8s %sstale/quiet (%ss)%s\n" "app-telemetry" "-" "$c_dim" "$age" "$c_off"
+    fi
+  else
+    printf "  %-18s %-8s %s— (app never ran)%s\n" "app-telemetry" "-" "$c_dim" "$c_off"
+  fi
   return $rc
 }
 

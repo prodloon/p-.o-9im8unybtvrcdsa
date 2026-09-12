@@ -215,6 +215,36 @@ The installed app and the repo stack are INDEPENDENT (separate data dirs,
 separate queues). `clusterctl` manages the repo stack only and shows the
 installed app's presence informationally.
 
+### 7.1 Two runtimes — who owns what
+
+Running `./clusterctl.sh status` shows **two labeled sections**. They are
+separate worlds that happen to share one machine:
+
+| | **REPO STACK** (`~/daisy-chain`) | **INSTALLED APP** (`/Applications`) |
+|---|---|---|
+| Managed by | `clusterctl` + the launchd supervisor | the app itself (open/close) |
+| Code | the working tree | the bundle's `Resources/appdata/` payload |
+| Data | `~/daisy-chain/database/` | `~/Library/Application Support/DaisyCluster/` |
+| API key | `~/daisy-chain/.env` | `Application Support/DaisyCluster/.env` |
+| Queue/DB | its own SQLite | its own SQLite |
+| Self-heal | launchd agent (15 s watchdog) | none — close/reopen the app |
+| Updated by | editing files + `clusterctl restart` | `./make-installer.sh` (full rebuild) |
+
+Coexistence rules (all proven live):
+- **Neither touches the other.** Discovery excludes the app's processes by
+  command path; the supervisor only heals the repo stack; the app's backend
+  is spawned by the app's shell, not by clusterctl.
+- **Ports are shared by design** (telemetry :6292 is repo-only; the app's
+  telemetry is a file the app's UI reads via IPC — no server). Nothing to
+  reconcile.
+- **Tasks are not portable.** Enqueuing via clusterctl goes to the repo
+  queue only; the app has its own. Pick one runtime per use case.
+- **Version drift is expected** — the app only updates when you run
+  `make-installer.sh`. `status` surfaces app-side staleness via the
+  `app-telemetry` freshness line; refresh with a full rebuild (the UI is
+  baked into the binary, so `--skip` restaging alone can strand an old
+  dashboard next to a new backend).
+
 Rebuild after backend/governor changes: `./make-installer.sh` (full) —
 the payload is re-staged automatically.
 

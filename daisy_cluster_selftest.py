@@ -228,6 +228,9 @@ def suite_control_script():
     check("ctl", "status runs and prints the service table",
           status.returncode in (0, 1) and "SERVICE" in status.stdout,
           status.stderr[:120])
+    check("ctl", "status shows the two-runtime split (repo stack vs installed app)",
+          "REPO STACK" in status.stdout and "INSTALLED APP" in status.stdout,
+          status.stdout[:200])
     check("ctl", "status exits 0 when the stack is up", status.returncode == 0,
           "stack down during battery" if status.returncode else "")
     if status.returncode == 0:
