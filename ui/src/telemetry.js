@@ -13,6 +13,9 @@
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
+/** Sentinel fed to the consumer when a poll fails outright (server down / non-OK). */
+export const FETCH_FAILED = Symbol('fetch-failed');
+
 export async function subscribeTelemetry(onSample) {
   if (isTauri()) {
     const { listen } = await import('@tauri-apps/api/event');
@@ -29,8 +32,11 @@ export async function subscribeTelemetry(onSample) {
       try {
         const res = await fetch('http://127.0.0.1:6292/api/telemetry');
         if (res.ok) onSample(await res.json());
+        else onSample(FETCH_FAILED);
       } catch {
-        /* server not up yet; keep trying quietly */
+        /* server not up yet; keep trying quietly — but tell the UI so the
+           badge can distinguish offline from stale */
+        onSample(FETCH_FAILED);
       }
       await new Promise((r) => setTimeout(r, 1000));
     }

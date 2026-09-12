@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { subscribeTelemetry, createThrottledFeed } from './telemetry.js';
+import { subscribeTelemetry, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
 
 const MAX_HISTORY = 60; // ~60s of samples at 1Hz
 
@@ -176,6 +176,7 @@ function CascadePanel({ cascade, costs }) {
 export default function App() {
   const [sample, setSample] = useState(null);
   const [connected, setConnected] = useState(false);
+  const [fetchFailed, setFetchFailed] = useState(false);
   const [history, setHistory] = useState([]);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const feedRef = useRef(null);
@@ -183,6 +184,13 @@ export default function App() {
   useEffect(() => {
     // Throttled feed: transport can be chatty; React commits stay at 2Hz.
     feedRef.current = createThrottledFeed((s) => {
+      if (s === FETCH_FAILED) {
+        // Telemetry server unreachable — keep the last sample on screen but
+        // let the badge say offline (distinct from stale: nothing is answering).
+        setFetchFailed(true);
+        return;
+      }
+      setFetchFailed(false);
       setSample(s);
       setConnected(!!(s && s.ts));
       setHistory((h) => [...h.slice(-MAX_HISTORY + 1), s?.ramPct ?? 0]);
@@ -221,7 +229,7 @@ export default function App() {
   // offline = no sample with a ts at all (telemetry server unreachable).
   const STALE_MS = 5000;
   const staleAgeSec = sample?.ts != null ? Math.max(0, Math.round((nowTick - sample.ts) / 1000)) : null;
-  const feedState = !connected ? 'offline' : staleAgeSec == null || staleAgeSec * 1000 <= STALE_MS ? 'live' : 'stale';
+  const feedState = fetchFailed || !connected ? 'offline' : staleAgeSec == null || staleAgeSec * 1000 <= STALE_MS ? 'live' : 'stale';
 
   return (
     <div className="min-h-screen bg-slate-900 p-6 text-slate-100">

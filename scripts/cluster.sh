@@ -211,6 +211,7 @@ core_ok() {
 
 cmd_supervise() {
   trap 'log "supervisor: TERM from launchd — leaving services as-is"; exit 0' TERM
+  trap 'log "supervisor: killed by signal $? during supervise — if this repeats, investigate logs/heal-debug.log"' INT HUP
   # Halt gate (crash-loop guard): a previous run that hit
   # MAX_CONSECUTIVE_FAILED_BOOTS left $HALT_FILE behind. Stay alive but idle
   # — no boot attempts — until the marker is cleared (explicit
@@ -259,18 +260,35 @@ cmd_supervise() {
       # Judge the heal by the stack's actual health, not cmd_start's exit:
       # the boot is idempotent and can exit 0 with services still broken.
       # --heal so the attempt doesn't clear the streak it's judged on.
-      if cmd_start --heal >/dev/null 2>&1 && core_ok; then
+      # Output is captured (not discarded) so a FAILED heal leaves evidence —
+      # a heal that fails invisibly cannot be debugged after the fact.
+      local heal_out cs
+      # Run the heal in an isolated subshell: any 'exit N' from the spawned
+      # control flow (clusterctl -> cmd_start -> …) must be able to fail the
+      # HEAL, never kill the SUPERVISOR — the 13:32-13:41 incidents showed a
+      # mid-heal supervisor death (launchd "last exit code = 1") that
+      # bypassed the guard counter entirely and looked like a silent no-op.
+      heal_out="$( (cmd_start --heal) 2>&1 )"; cs=$?
+      if core_ok; then
         rm -f "$FAIL_FILE"   # healthy stack = failed streak over
       else
         local n=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$FAIL_FILE"
+        local tel_age http_code
+        tel_age=$(( $(date +%s) - $(node -e "console.log(Math.round(require('fs').statSync(process.argv[1]).mtimeMs/1000))" "$ROOT/database/telemetry.json" 2>/dev/null || echo 0) ))
+        http_code=$(curl -sf -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:6292/api/telemetry" 2>/dev/null || echo fail)
+        {
+          echo "── heal failed $(date '+%Y-%m-%d %H:%M:%S') — cmd_start exit $cs · telemetry age ${tel_age}s · http $http_code"
+          echo "$heal_out"
+          echo
+        } >> "$LOGDIR/heal-debug.log"
         if [ "$n" -ge "$MAX_CONSECUTIVE_FAILED_BOOTS" ]; then
           alert "Halted: ${n} consecutive failed heals — healing stopped. Resume with: scripts/cluster.sh restart"
           touch "$HALT_FILE"
           log "supervisor: halt marker written — healing suspended; services left as-is"
           exit 1
         fi
-        log "supervisor: heal attempt failed ($n/${MAX_CONSECUTIVE_FAILED_BOOTS} consecutive) — retrying next tick"
+        log "supervisor: heal attempt failed ($n/${MAX_CONSECUTIVE_FAILED_BOOTS} consecutive, cmd_start exit $cs) — retrying next tick (details: logs/heal-debug.log)"
       fi
     else
       # Healthy tick: any failed-heal streak is over.
