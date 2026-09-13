@@ -71,7 +71,7 @@ def suite_backend_battery():
     print("== SUITE 2: BACKEND BATTERY (node) ==")
     code, out, _err = run_node("backend/backend.selftest.js")
     check("backend", "battery exits 0", code == 0)
-    check("backend", "164/164 checks pass", "164 passed, 0 failed" in out)
+    check("backend", "185/185 checks pass", "185 passed, 0 failed" in out)
     check("backend", "covers SNIPE gate",
           any("SNIPE" in line for line in out.splitlines()))
     check("backend", "covers permanent model mappings",

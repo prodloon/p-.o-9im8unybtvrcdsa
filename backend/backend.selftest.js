@@ -695,7 +695,12 @@ async function main() {
   // ============================================================================
   suite('S20: key-health — classifier, masked telemetry, probe loop');
   {
-    const ROTATION_KEY = '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';
+    // FIXTURE KEY IS SYNTHETIC (S23-enforced): the 2026-09-12 leak — the real
+    // key hardcoded here, committed, and tagged — is why scripts/scan-secrets.js
+    // gates every push. Built from fragments so no full-shape key literal
+    // exists in source: the scanner cannot tell synthetic from real, and it
+    // must never have to. Never put a live key in this file.
+    const ROTATION_KEY = ['sk-or-v1-', '0f3e5d7c9a1b2c8d', '4e6f0a9b8c7d6e5f', '4a3b2c1d0e9f8a7b'].join('');
     const ROTATION_FP = fingerprintKey(ROTATION_KEY);
 
     // 20a. classifyKeyResponse — every HTTP shape the probe can see
@@ -716,7 +721,8 @@ async function main() {
 
     // 20b. fingerprint — masked, short, safe for logs and telemetry
     {
-      check('fingerprint masks the middle', ROTATION_FP.startsWith('sk-or-v1-2b8') && ROTATION_FP.endsWith('6361') && ROTATION_FP.includes('…'));
+      check('fingerprint masks the middle', ROTATION_FP.startsWith(ROTATION_KEY.slice(0, 12)) && ROTATION_FP.endsWith(ROTATION_KEY.slice(-4)) && ROTATION_FP.includes('…'));
+      check('fingerprint shape = head12 + … + tail4 (pinned on synthetic key)', ROTATION_FP === `${ROTATION_KEY.slice(0, 12)}…${ROTATION_KEY.slice(-4)}`);
       check('fingerprint carries ≤ 16 key chars', ROTATION_FP.replace('…', '').length <= 16);
       check('short key → ??', fingerprintKey('abc') === '??');
       check('non-string → ??', fingerprintKey(null) === '??');
@@ -944,6 +950,72 @@ async function main() {
       } finally {
         env.cleanup();
       }
+    }
+  }
+
+  // ============================================================================
+  suite('S23: secret-leak scanner — detection, masking, allowlist, tracked scope');
+  {
+    const { findSecrets, scanTrackedFiles, maskSecret, MASKED_ALLOW, DETECTORS: SECRET_KINDS } = require('../scripts/scan-secrets');
+    const hits = (s) => findSecrets(s).map((f) => f.kind);
+    // DOCTRINE (the 23d self-scan enforces it): full-shape secret literals
+    // never appear in source — test fixtures included. Build at runtime.
+    const OPENROUTER_TEST = ['sk-or-v1-', '2b870c79c059930a', '7c20aa6e1eaab1cad'].join('');
+    const GENERIC_TEST = ['sk-', 'QW3rTy8UiOp1AsDf2', 'Gh5Jk6Lz4XcVb7'].join('');
+    const GHP_TEST = ['ghp_', '1234567890abcdefghij', 'klmnopqrstuv'].join('');
+    const XOX_TEST = ['xoxb-', '123456789012-', 'abcdefghijklmnop'].join('');
+    const AKIA_TEST = ['AKIA', 'IOSFODNN7', 'EXAMPLE'].join('');
+
+    // 23a. per-detector coverage — every committed-secret shape trips
+    {
+      const f = findSecrets(`const k = "${OPENROUTER_TEST}";`);
+      check('openrouter key detected + masked in the finding', f.length === 1 && f[0].kind === 'openrouter-key' && /^.{8}….{4}$/.test(f[0].masked));
+      check('finding carries a line number', f[0].line === 1);
+      check('generic sk- key detected', hits(`token: ${GENERIC_TEST}`).includes('generic-sk-key'));
+      check('sk-or-v1- NOT double-reported by the generic detector', hits(OPENROUTER_TEST).filter((k) => k === 'generic-sk-key').length === 0);
+      check('github token detected', hits(GHP_TEST).includes('github-token'));
+      check('slack token detected', hits(XOX_TEST).includes('slack-token'));
+      check('aws access key detected (exact AKIA shape)', hits(AKIA_TEST).includes('aws-access-key'));
+      const PEM_HDR = ['-----BEGIN ', 'RSA PRIVATE KEY', '-----'].join(''); // fragment-built: the self-scan flags a literal PEM header
+      check('private key block detected', hits(PEM_HDR).includes('private-key-block'));
+      check('key-assignment literal detected', hits(`OPENROUTER_API_KEY = "${['2b870c79c059930a', '7c20aa6e1eaab1cad'].join('')}"`).includes('key-assignment'));
+      check('DETECTOR table pinned', JSON.stringify(SECRET_KINDS) === JSON.stringify(['openrouter-key', 'generic-sk-key', 'github-token', 'slack-token', 'aws-access-key', 'private-key-block', 'key-assignment']));
+    }
+
+    // 23b. allowlist + false-positive discipline
+    {
+      check('masked-fingerprint form (the repo idiom) is ALWAYS clean', findSecrets('fp sk-or-v1-2b8…6361 in a comment').length === 0 && MASKED_ALLOW.test('sk-or-v1-2b8…6361'));
+      check('env-var indirection is not a secret', findSecrets('const API_KEY = process.env.OPENROUTER_API_KEY;').length === 0);
+      check('short fragments stay silent (no full shape)', findSecrets('sk-or-v1- short and OPENROUTER_API_KEY from .env').length === 0);
+      check('non-string input → no findings, no throw', findSecrets(null).length === 0 && findSecrets(42).length === 0);
+      check('maskSecret keeps head+tail only', maskSecret('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') === 'sk-or-v1…6361');
+      check('short string → opaque ellipsis', maskSecret('tiny') === '…');
+    }
+
+    // 23c. tracked-file scope — .gitignore is respected BY CONSTRUCTION
+    {
+      const env = makeEnv();
+      try {
+        const { execSync } = require('child_process');
+        execSync('git init -q', { cwd: env.tmp });
+        fs.writeFileSync(path.join(env.tmp, 'clean.txt'), 'just docs and sk-or-v1-abc…wxyz fingerprints');
+        fs.writeFileSync(path.join(env.tmp, 'leak.txt'), `key = ${OPENROUTER_TEST}`);
+        fs.writeFileSync(path.join(env.tmp, 'ignored.txt'), 'sk-or-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+        fs.writeFileSync(path.join(env.tmp, '.gitignore'), 'ignored.txt\n');
+        execSync('git add clean.txt leak.txt .gitignore', { cwd: env.tmp });
+        const found = scanTrackedFiles(env.tmp);
+        check('exactly the tracked leaking file trips', found.length === 1 && found[0].file === 'leak.txt' && found[0].kind === 'openrouter-key');
+        check('gitignored file never scanned', !JSON.stringify(found).includes('ignored.txt'));
+        check('clean tracked file silent', !JSON.stringify(found).includes('clean.txt'));
+      } finally {
+        env.cleanup();
+      }
+    }
+
+    // 23d. the battery scans ITSELF — this file must never hold a full-shape key
+    {
+      const own = fs.readFileSync(__filename, 'utf8');
+      check('backend.selftest.js source is scan-clean (fixture built from fragments)', findSecrets(own).length === 0, 'a full-shape key literal re-entered this file');
     }
   }
 

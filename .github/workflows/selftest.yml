@@ -90,6 +90,8 @@ jobs:
         working-directory: src-tauri
         timeout-minutes: 20
 
+      - name: Secret-leak scan (S23 doctrine — full-shape keys never commit)
+        run: node scripts/scan-secrets.js
       - name: Suite 1+2 — node batteries (governor + backend)
         run: |
           node governor/governor.selftest.js
