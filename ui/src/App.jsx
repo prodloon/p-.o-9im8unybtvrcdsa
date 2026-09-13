@@ -65,6 +65,38 @@ function KeyHealthChip({ kh }) {
   );
 }
 
+/** Tier-2 residency chip — verdict from the backend's cached canary probe
+ *  (backend/t2-canary.js): is qwen actually loaded? dead = silent tier-3 cost. */
+const T2_HEALTH_TONES = {
+  resident: 'text-emerald-400',
+  unknown: 'text-slate-500',
+  dead: 'text-rose-400',
+  unreachable: 'text-rose-400',
+  error: 'text-amber-400',
+  off: 'text-slate-500',
+};
+function T2HealthChip({ t2 }) {
+  if (!t2) return null;
+  const tone = T2_HEALTH_TONES[t2.status] || 'text-slate-500';
+  const sub = t2.status === 'dead'
+    ? ' · qwen not resident — consults degrading to tier-3 ($)'
+    : t2.status === 'unreachable'
+      ? ' · ollama not answering — tier-2 and warm-up impossible'
+      : t2.status === 'off'
+        ? ' · keep_alive=0 — residency not expected'
+        : t2.status === 'error'
+          ? ' · probe failed'
+          : '';
+  return (
+    <span
+      className={`ml-2 inline-flex items-center gap-1 ${tone}`}
+      title={`tier-2 ${t2.model ?? '—'} · models loaded: ${t2.loadedCount ?? '—'} · checked ${t2.checkedAt ? new Date(t2.checkedAt).toLocaleTimeString() : 'never'}${t2.alertCount ? ` · alerts fired: ${t2.alertCount}` : ''}`}
+    >
+      <span className="font-mono text-[11px] text-slate-500">t2</span> {t2.status}{sub}
+    </span>
+  );
+}
+
 /** Tiny inline sparkline — SVG polyline, no chart lib, no re-render storms. */
 function Spark({ data, tone = '#38bdf8' }) {
   const pts = useMemo(() => {
@@ -283,6 +315,7 @@ export default function App() {
               {feedState === 'live' ? 'live' : feedState === 'stale' ? `stale — orchestrator unreachable · data ${staleAgeSec}s old` : 'offline'}
             </span>
             <KeyHealthChip kh={sample?.keyHealth} />
+            <T2HealthChip t2={sample?.t2Health} />
           </p>
         </div>
         <div className="text-right text-xs text-slate-500">

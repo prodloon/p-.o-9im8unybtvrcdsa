@@ -33,6 +33,7 @@ const { parseSupervisorLog } = require('./supervisor-log-parser');
 const { resolveSupervisorRoot } = require('./supervisor-root');
 const { SkillInjector } = require('./skill-injector');
 const { KeyHealthMonitor } = require('./key-health');
+const { T2Canary } = require('./t2-canary');
 
 const ORCH_POLICY = {
   TICK_MS: 2000,           // governor watchdog cadence (matches knowledge.md)
@@ -74,6 +75,10 @@ class Orchestrator {
     // OpenRouter key health (dashboard badge). Own interval loop — NEVER a
     // network probe inside the 1 Hz telemetry path. Injectable for tests.
     this.keyHealth = opts.keyHealth || new KeyHealthMonitor(opts.keyHealthOpts || {});
+    // Dead-T2 residency canary (dashboard badge + edge-triggered alerts).
+    // The 2026-09-12 lesson: a dead tier-2 degrades every consult to tier-3
+    // silently. Own interval loop — NEVER inside the 1 Hz telemetry path.
+    this.t2Canary = opts.t2Canary || new T2Canary(opts.t2CanaryOpts || {});
     this._catalogCache = { at: 0, names: null };
     this._cycle = 0;
     // 3-Tier cascade accounting (telemetry + dashboard pipeline panel)
@@ -244,6 +249,10 @@ class Orchestrator {
     if (this.verbose) console.log(`[orch] serving — tick ${this.tickMs}ms, target fleet ${this.pool.targetSize}`);
     // Key-health probe loop (no-op without an API key; unref'd timer).
     this.keyHealth.start();
+    // T2 residency canary: the first probe fires here — seconds after the
+    // boot warm-up attempt — so a failed warm-up alerts immediately instead
+    // of silently degrading every consult to tier-3 (unref'd timer).
+    this.t2Canary.start();
     // Orphan guard (app-bundle backend only): when the Tauri shell dies
     // abnormally (kill -9, AppleScript quit bypassing the child-reaper),
     // the backend would linger as a duplicate orchestrator fighting over
@@ -394,6 +403,8 @@ class Orchestrator {
       supervisorEvents: this._supervisorEvents(),
       // OpenRouter key health (dashboard badge) — masked, never the key itself
       keyHealth: this.keyHealth.snapshot(),
+      // Tier-2 residency canary (dashboard badge) — is qwen actually loaded?
+      t2Health: this.t2Canary.snapshot(),
     };
   }
 
