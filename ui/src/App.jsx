@@ -28,6 +28,43 @@ function Gauge({ label, pct, sub, tone = 'sky' }) {
   );
 }
 
+/** OpenRouter key-health chip — verdict from the backend's cached probe loop
+ *  (backend/key-health.js): never the key itself, only a masked fingerprint. */
+const KEY_HEALTH_TONES = {
+  ok: 'text-emerald-400',
+  unknown: 'text-slate-500',
+  'rate-limited': 'text-amber-400',
+  exhausted: 'text-rose-400',
+  invalid: 'text-rose-400',
+  missing: 'text-rose-400',
+  error: 'text-amber-400',
+};
+function KeyHealthChip({ kh }) {
+  if (!kh) return null;
+  const tone = KEY_HEALTH_TONES[kh.status] || 'text-slate-500';
+  const sub = kh.status === 'ok' && kh.limit != null
+    ? ` · $${(kh.remaining ?? 0).toFixed(2)} left of $${kh.limit.toFixed(2)}`
+    : kh.status === 'ok'
+      ? ''
+      : kh.status === 'invalid'
+        ? ' · key revoked or wrong — rotate OPENROUTER_API_KEY'
+        : kh.status === 'exhausted'
+          ? ' · limit reached or no credits'
+          : kh.status === 'missing'
+            ? ' · OPENROUTER_API_KEY not set'
+            : kh.status === 'error'
+              ? ' · probe failed (network?)'
+              : '';
+  return (
+    <span
+      className={`ml-2 inline-flex items-center gap-1 ${tone}`}
+      title={kh.fingerprint ? `key ${kh.fingerprint} · label ${kh.label ?? '—'} · checked ${kh.checkedAt ? new Date(kh.checkedAt).toLocaleTimeString() : 'never'}` : 'no key configured'}
+    >
+      <span className="font-mono text-[11px] text-slate-500">key</span> {kh.status}{sub}
+    </span>
+  );
+}
+
 /** Tiny inline sparkline — SVG polyline, no chart lib, no re-render storms. */
 function Spark({ data, tone = '#38bdf8' }) {
   const pts = useMemo(() => {
@@ -245,6 +282,7 @@ export default function App() {
               <span className={`inline-block h-2 w-2 rounded-full ${feedState === 'live' ? 'animate-pulse bg-emerald-400' : feedState === 'stale' ? 'bg-amber-400' : 'bg-rose-400'}`} />
               {feedState === 'live' ? 'live' : feedState === 'stale' ? `stale — orchestrator unreachable · data ${staleAgeSec}s old` : 'offline'}
             </span>
+            <KeyHealthChip kh={sample?.keyHealth} />
           </p>
         </div>
         <div className="text-right text-xs text-slate-500">

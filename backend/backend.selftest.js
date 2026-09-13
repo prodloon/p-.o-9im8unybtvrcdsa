@@ -16,6 +16,7 @@ const { WorkerPool } = require('./worker-pool');
 const { SupervisorBridge, POLICY } = require('./supervisor-bridge');
 const { SkillInjector } = require('./skill-injector');
 const { Orchestrator } = require('./index');
+const { KeyHealthMonitor, classifyKeyResponse, fingerprintKey, CLASSIFICATION } = require('./key-health');
 
 let pass = 0;
 let fail = 0;
@@ -688,6 +689,101 @@ async function main() {
         else process.env[k] = v;
       }
       try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  // ============================================================================
+  suite('S20: key-health — classifier, masked telemetry, probe loop');
+  {
+    const ROTATION_KEY = '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';
+    const ROTATION_FP = fingerprintKey(ROTATION_KEY);
+
+    // 20a. classifyKeyResponse — every HTTP shape the probe can see
+    {
+      check('401 → invalid (revoked key)', classifyKeyResponse(401, null).status === 'invalid' && classifyKeyResponse(401, null).usage === null);
+      check('403 → invalid too', classifyKeyResponse(403, null).status === 'invalid');
+      check('402 → exhausted (no credits at provider)', classifyKeyResponse(402, null).status === 'exhausted');
+      check('429 → rate-limited (transient, not dead)', classifyKeyResponse(429, null).status === 'rate-limited');
+      check('500 → error (transient)', classifyKeyResponse(500, null).status === 'error');
+      check('2xx garbage body → error (fail closed, not ok)', classifyKeyResponse(200, { nope: 1 }).status === 'error');
+      const ok = classifyKeyResponse(200, { data: { label: 'daisy-cluster', usage: 0.0114, limit: 5 } });
+      check('2xx limited key → ok with remaining + label', ok.status === 'ok' && ok.remaining === 5 - 0.0114 && ok.label === 'daisy-cluster');
+      check('usage ≥ limit → exhausted without a 402', classifyKeyResponse(200, { data: { usage: 5, limit: 5 } }).status === 'exhausted');
+      const unlimited = classifyKeyResponse(200, { data: { usage: 1.2, limit: null } });
+      check('2xx unlimited key (limit null) → ok, not exhausted', unlimited.status === 'ok' && unlimited.limitReached === false);
+      check('CLASSIFICATION table pinned', JSON.stringify(CLASSIFICATION) === JSON.stringify(['ok', 'exhausted', 'rate-limited', 'invalid', 'missing', 'error', 'unknown']));
+    }
+
+    // 20b. fingerprint — masked, short, safe for logs and telemetry
+    {
+      check('fingerprint masks the middle', ROTATION_FP.startsWith('sk-or-v1-2b8') && ROTATION_FP.endsWith('6361') && ROTATION_FP.includes('…'));
+      check('fingerprint carries ≤ 16 key chars', ROTATION_FP.replace('…', '').length <= 16);
+      check('short key → ??', fingerprintKey('abc') === '??');
+      check('non-string → ??', fingerprintKey(null) === '??');
+    }
+
+    // 20c. monitor lifecycle — injectable fetch/clock, never throws
+    {
+      let calls = 0;
+      const responses = [
+        { status: 200, json: async () => ({ data: { label: 'daisy-cluster', usage: 0.5, limit: 10 } }) },
+        { status: 401, json: async () => ({ error: { message: 'User not found' } }) },
+        { status: 429, json: async () => ({}) },
+      ];
+      const fetchImpl = async () => { calls += 1; const r = responses[Math.min(calls - 1, responses.length - 1)]; return { status: r.status, json: r.json }; };
+      const m = new KeyHealthMonitor({ fetchImpl, apiKey: ROTATION_KEY, clock: () => 12345 });
+      check('pre-probe state is unknown (never optimistically ok)', m.snapshot().status === 'unknown');
+      await m.probe();
+      let s = m.snapshot();
+      check('probe 1: ok + label + remaining + checkedAt', s.status === 'ok' && s.label === 'daisy-cluster' && s.remaining === 9.5 && s.checkedAt === 12345 && s.probeCount === 1);
+      check('snapshot carries fingerprint, never the key', s.fingerprint === ROTATION_FP && !JSON.stringify(s).includes(ROTATION_KEY));
+      await m.probe();
+      check('probe 2: 401 flips to invalid (the rotation alarm)', m.snapshot().status === 'invalid' && m.snapshot().httpStatus === 401);
+      await m.probe();
+      check('probe 3: 429 → rate-limited', m.snapshot().status === 'rate-limited');
+
+      const m2 = new KeyHealthMonitor({ fetchImpl: async () => { throw new Error('ECONNREFUSED'); }, apiKey: ROTATION_KEY, clock: () => 999 });
+      await m2.probe();
+      check('network failure → error state, probe() never throws', m2.snapshot().status === 'error' && /ECONNREFUSED/.test(m2.snapshot().error));
+
+      const m3 = new KeyHealthMonitor({ fetchImpl, apiKey: null });
+      const callsBefore = calls;
+      await m3.probe();
+      check('no key → missing, zero fetches', m3.snapshot().status === 'missing' && calls === callsBefore);
+      m3.start();
+      check('start() no-ops without a key', m3._timer === null);
+
+      let loopCalls = 0;
+      const m4 = new KeyHealthMonitor({ fetchImpl: async () => { loopCalls += 1; return { status: 200, json: async () => ({ data: { usage: 0, limit: 1 } }) }; }, apiKey: ROTATION_KEY, clock: () => 1, intervalMs: 10 });
+      m4.start();
+      await new Promise((r) => setTimeout(r, 60));
+      m4.stop();
+      check('start() probes immediately + loop runs', loopCalls >= 2 && m4.snapshot().status === 'ok');
+      const atStop = loopCalls;
+      await new Promise((r) => setTimeout(r, 40));
+      check('stop() really stops the interval', loopCalls === atStop);
+    }
+
+    // 20d. orchestrator integration — masked payload, probe-free 1 Hz path
+    {
+      const env = makeEnv();
+      try {
+        let probes = 0;
+        const kh = new KeyHealthMonitor({ apiKey: ROTATION_KEY, clock: () => 12345, fetchImpl: async () => { probes += 1; return { status: 200, json: async () => ({ data: { label: 'daisy-cluster', usage: 0.5, limit: 10 } }) }; } });
+        await kh.probe();
+        const bridge = new SupervisorBridge({ apiKey: null });
+        const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox'), keyHealth: kh });
+        const tel = orch.telemetry();
+        check('telemetry exposes keyHealth verdict', !!tel.keyHealth && tel.keyHealth.status === 'ok' && tel.keyHealth.label === 'daisy-cluster');
+        check('telemetry JSON never contains the raw key', !JSON.stringify(tel).includes(ROTATION_KEY));
+        const before = probes;
+        orch.telemetry(); orch.telemetry(); orch.telemetry();
+        check('telemetry() never probes the network (1 Hz path stays probe-free)', probes === before);
+        check('injected monitor is the one wired in', orch.keyHealth === kh);
+        orch.close();
+      } finally {
+        env.cleanup();
+      }
     }
   }
 

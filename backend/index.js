@@ -32,6 +32,7 @@ const { SupervisorBridge } = require('./supervisor-bridge');
 const { parseSupervisorLog } = require('./supervisor-log-parser');
 const { resolveSupervisorRoot } = require('./supervisor-root');
 const { SkillInjector } = require('./skill-injector');
+const { KeyHealthMonitor } = require('./key-health');
 
 const ORCH_POLICY = {
   TICK_MS: 2000,           // governor watchdog cadence (matches knowledge.md)
@@ -70,6 +71,9 @@ class Orchestrator {
       skillbaseDir: opts.skillbaseDir || path.join(this.root, 'skillbase'),
       governor: this.governor,
     });
+    // OpenRouter key health (dashboard badge). Own interval loop — NEVER a
+    // network probe inside the 1 Hz telemetry path. Injectable for tests.
+    this.keyHealth = opts.keyHealth || new KeyHealthMonitor(opts.keyHealthOpts || {});
     this._catalogCache = { at: 0, names: null };
     this._cycle = 0;
     // 3-Tier cascade accounting (telemetry + dashboard pipeline panel)
@@ -238,6 +242,8 @@ class Orchestrator {
   /** Long-running mode. */
   async serve() {
     if (this.verbose) console.log(`[orch] serving — tick ${this.tickMs}ms, target fleet ${this.pool.targetSize}`);
+    // Key-health probe loop (no-op without an API key; unref'd timer).
+    this.keyHealth.start();
     // Orphan guard (app-bundle backend only): when the Tauri shell dies
     // abnormally (kill -9, AppleScript quit bypassing the child-reaper),
     // the backend would linger as a duplicate orchestrator fighting over
@@ -386,6 +392,8 @@ class Orchestrator {
       supervisor: this._supervisorGuard(),
       // Recent supervisor events (dashboard heal strip) + log freshness
       supervisorEvents: this._supervisorEvents(),
+      // OpenRouter key health (dashboard badge) — masked, never the key itself
+      keyHealth: this.keyHealth.snapshot(),
     };
   }
 
