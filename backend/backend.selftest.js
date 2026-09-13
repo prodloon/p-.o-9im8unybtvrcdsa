@@ -843,6 +843,111 @@ async function main() {
   }
 
   // ============================================================================
+  suite('S22: t2-canary — residency classifier, edge-triggered alerts, wiring');
+  {
+    const { T2Canary, classifyPsResponse, CLASSIFICATION: T2_CLASS, BAD_STATES } = require('./t2-canary');
+    const psBody = (names) => ({ models: names.map((n) => ({ name: n, expires_at: '2318-12-23T17:30:09Z', size_vram: 5062566870 })) });
+
+    // 22a. classifier — every HTTP shape the probe can see
+    {
+      const r = classifyPsResponse(200, psBody(['qwen2.5:7b']), 'qwen2.5:7b');
+      check('200 + qwen listed → resident with model + vram', r.status === 'resident' && r.model === 'qwen2.5:7b' && r.sizeVram === 5062566870);
+      check('dead: 200 but qwen absent (the killer state)', classifyPsResponse(200, psBody(['llama3:8b']), 'qwen2.5:7b').status === 'dead');
+      check('dead carries what IS loaded', classifyPsResponse(200, psBody(['llama3:8b']), 'qwen2.5:7b').loadedCount === 1);
+      check('transport failure → unreachable', classifyPsResponse(0, null, 'qwen2.5:7b').status === 'unreachable');
+      check('5xx → unreachable (ollama answering, T2 impossible)', classifyPsResponse(500, null, 'qwen2.5:7b').status === 'unreachable');
+      check('2xx garbage body → error (API drift, fail closed)', classifyPsResponse(200, { nope: 1 }, 'qwen2.5:7b').status === 'error');
+      check('2xx null body → error', classifyPsResponse(200, null, 'qwen2.5:7b').status === 'error');
+      check('name prefix match (same semantics as cluster.sh grep)', classifyPsResponse(200, psBody(['qwen2.5:7b-instruct']), 'qwen2.5:7b').status === 'resident');
+      check('CLASSIFICATION table pinned', JSON.stringify(T2_CLASS) === JSON.stringify(['resident', 'dead', 'unreachable', 'error', 'off', 'unknown']));
+      check('BAD_STATES pinned (dead + unreachable alert; error stays silent)', JSON.stringify(BAD_STATES) === JSON.stringify(['dead', 'unreachable']));
+    }
+
+    // 22b. canary lifecycle — injectable fetch/clock/alert, never throws
+    {
+      const alerts = [];
+      const m = new T2Canary({ fetchImpl: async () => ({ status: 200, json: async () => psBody(['qwen2.5:7b']) }), clock: () => 777 });
+      check('pre-probe state is unknown (never optimistically resident)', m.snapshot().status === 'unknown');
+      await m.probe();
+      const s = m.snapshot();
+      check('probe 1: resident + checkedAt + probeCount + since', s.status === 'resident' && s.checkedAt === 777 && s.probeCount === 1 && s.since === 777);
+
+      const m2 = new T2Canary({ fetchImpl: async () => ({ status: 200, json: async () => psBody(['llama3:8b']) }), clock: () => 1000, alert: (msg) => alerts.push(msg) });
+      await m2.probe();
+      check('qwen missing → dead + ONE edge-triggered alert', m2.snapshot().status === 'dead' && alerts.length === 1 && /not resident/.test(alerts[0]));
+      await m2.probe();
+      await m2.probe();
+      check('still dead → NO alert spam (edge-triggered, not level-triggered)', m2.snapshot().status === 'dead' && alerts.length === 1);
+      check('alertCount and lastAlertAt recorded', m2.snapshot().alertCount === 1 && m2.snapshot().lastAlertAt === 1000);
+
+      let t = 1000;
+      const m3 = new T2Canary({ fetchImpl: async () => ({ status: 200, json: async () => psBody([]) }), clock: () => t, alert: () => {}, reAlertMs: 5000 });
+      await m3.probe();
+      const firstAlerts = m3.snapshot().alertCount;
+      t += 1000;
+      await m3.probe();
+      check('re-alert suppressed inside cooldown window', m3.snapshot().alertCount === firstAlerts);
+      t += 5000;
+      await m3.probe();
+      check('re-alert fires after cooldown while still dead', m3.snapshot().alertCount === firstAlerts + 1);
+
+      const m4 = new T2Canary({ fetchImpl: async () => { throw new Error('ECONNREFUSED'); }, clock: () => 42, alert: (msg) => alerts.push(msg) });
+      await m4.probe();
+      check('network failure → unreachable, probe() never throws', m4.snapshot().status === 'unreachable' && /ECONNREFUSED/.test(m4.snapshot().error));
+      check('unreachable alerts too (boot-killer state: warm-up impossible)', /UNREACHABLE/.test(alerts[alerts.length - 1]));
+
+      let bad = true;
+      const m6 = new T2Canary({ fetchImpl: async () => ({ status: 200, json: async () => (bad ? psBody([]) : psBody(['qwen2.5:7b'])) }), clock: () => 60, alert: (msg) => alerts.push(msg) });
+      await m6.probe();
+      bad = false;
+      await m6.probe();
+      check('recovery logged, cooldown reset for the next incident', m6.snapshot().status === 'resident' && m6.snapshot().lastAlertAt === null);
+
+      let offCalls = 0;
+      const alertsBefore = alerts.length;
+      const m7 = new T2Canary({ keepAlive: 0, fetchImpl: async () => { offCalls += 1; return { status: 200, json: async () => psBody([]) }; }, clock: () => 1, alert: (msg) => alerts.push(msg) });
+      await m7.probe();
+      check('keep_alive=0 → status off, zero fetches, no false alarm', m7.snapshot().status === 'off' && offCalls === 0 && alerts.length === alertsBefore);
+      m7.start();
+      check('start() no-ops when off (residency not expected by policy)', m7._timer === null);
+
+      let loopCalls = 0;
+      const m8 = new T2Canary({ fetchImpl: async () => { loopCalls += 1; return { status: 200, json: async () => psBody(['qwen2.5:7b']) }; }, clock: () => 1, intervalMs: 10, alert: () => {} });
+      m8.start();
+      await new Promise((r) => setTimeout(r, 60));
+      m8.stop();
+      check('start() probes immediately + loop runs', loopCalls >= 2);
+      const atStop = loopCalls;
+      await new Promise((r) => setTimeout(r, 40));
+      check('stop() really stops the interval', loopCalls === atStop);
+    }
+
+    // 22c. orchestrator integration — telemetry exposure, probe-free 1 Hz path
+    {
+      const env = makeEnv();
+      try {
+        let probes = 0;
+        const canary = new T2Canary({ clock: () => 31415, fetchImpl: async () => { probes += 1; return { status: 200, json: async () => psBody(['qwen2.5:7b']) }; } });
+        await canary.probe();
+        const bridge = new SupervisorBridge({ apiKey: null });
+        const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox'), t2Canary: canary });
+        const tel = orch.telemetry();
+        check('telemetry exposes t2Health verdict', !!tel.t2Health && tel.t2Health.status === 'resident' && tel.t2Health.checkedAt === 31415);
+        const before = probes;
+        orch.telemetry();
+        orch.telemetry();
+        orch.telemetry();
+        check('telemetry() never probes ollama (1 Hz path stays probe-free)', probes === before);
+        check('injected canary is the one wired in', orch.t2Canary === canary);
+        check('payload carries both health badges', 'keyHealth' in tel && 't2Health' in tel);
+        orch.close();
+      } finally {
+        env.cleanup();
+      }
+    }
+  }
+
+  // ============================================================================
   suite('S11: governor regression — Phase 1 battery still green');
   {
     const { execFileSync } = require('child_process');
