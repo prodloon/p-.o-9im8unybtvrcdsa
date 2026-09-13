@@ -71,13 +71,13 @@ def suite_backend_battery():
     print("== SUITE 2: BACKEND BATTERY (node) ==")
     code, out, _err = run_node("backend/backend.selftest.js")
     check("backend", "battery exits 0", code == 0)
-    check("backend", "129/129 checks pass", "129 passed, 0 failed" in out)
+    check("backend", "136/136 checks pass", "136 passed, 0 failed" in out)
     check("backend", "covers SNIPE gate",
           any("SNIPE" in line for line in out.splitlines()))
     check("backend", "covers permanent model mappings",
           "permanent mappings enforced" in out and "rejected (permanent pin)" in out)
-    check("backend", "covers SNIPE-gate integrity (no stale-skill carryover)",
-          "no stale-skill carryover across tasks" in out)
+    check("backend", "covers confidence-score escalation",
+          "confidence-score dynamic escalation" in out)
 
 
 def suite_live_pipeline():

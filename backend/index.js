@@ -129,7 +129,7 @@ class Orchestrator {
       const outcome = this.injector.applyVerdict(routed.verdict, worker.id, task.id, src);
       if (outcome.injected) {
         this._tiers[src] = (this._tiers[src] || 0) + 1;
-        this._lastTier = { source: src, model: routed.model, latencyMs: routed.latencyMs };
+        this._lastTier = { source: src, model: routed.model, latencyMs: routed.latencyMs, escalated: routed.escalated === true || undefined };
         if (this.verbose) console.log(`[orch] task ${task.id} → ${src} (${routed.model}) in ${routed.latencyMs}ms`);
         return outcome;
       }

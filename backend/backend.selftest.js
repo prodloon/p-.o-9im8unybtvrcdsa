@@ -232,7 +232,7 @@ async function main() {
       fetchImpl: async (url, opts) => {
         if (String(url).includes('11434')) {
           t2body = JSON.parse(opts.body);
-          return { ok: true, status: 200, json: async () => ({ message: { content: '{"verdict":"delegate","skill":"api-route-map","confidence":0.8,"inject":true}' } }) };
+          return { ok: true, status: 200, json: async () => ({ message: { content: '{"verdict":"delegate","skill":"api-route-map","confidence":0.9,"inject":true}' } }) };
         }
         return openRouterResponse('{"verdict":"reject"}');
       },
@@ -784,6 +784,61 @@ async function main() {
       } finally {
         env.cleanup();
       }
+    }
+  }
+
+  // ============================================================================
+  suite('S21: bridge — confidence-score dynamic escalation (T2 → T3)');
+  {
+    const ESC_SUMMARY = 'no template ever hits this borderline triage probe';
+    const payloadFor = (b) => b.buildRequestPayload({ workerId: 'w', taskKind: 'k', taskSummary: ESC_SUMMARY, skillsCatalog: ['api-route-map'] });
+    const t2Verdict = (conf) => async () => ({ ok: true, status: 200, json: async () => ({ message: { content: JSON.stringify({ verdict: 'delegate', skill: 'api-route-map', confidence: conf, inject: true }) } }) });
+    const t3Verdict = () => openRouterResponse('{"verdict":"delegate","skill":"scaffold-express-api","confidence":0.95,"inject":true}');
+
+    // 21a. confident T2 verdict is trusted — zero cloud calls
+    {
+      let cloudCalls = 0;
+      const b = new SupervisorBridge({ apiKey: 'k', fetchImpl: async (url) => { if (!String(url).includes('11434')) cloudCalls += 1; return t2Verdict(0.9)(); }, sleep: async () => {} });
+      const r = await b.routeTask(payloadFor(b), []);
+      check('confident T2 (0.9 ≥ 0.85) trusted — no T3 call', r.source === 'tier2-local' && cloudCalls === 0 && r.escalated === undefined);
+    }
+    // 21b. borderline escalates to T3 and the frontier verdict wins
+    {
+      let cloudCalls = 0;
+      const b = new SupervisorBridge({ apiKey: 'k', fetchImpl: async (url) => { if (!String(url).includes('11434')) cloudCalls += 1; return String(url).includes('11434') ? t2Verdict(0.6)() : t3Verdict(); }, sleep: async () => {} });
+      const r = await b.routeTask(payloadFor(b), []);
+      check('borderline T2 (0.6 < 0.85) escalates — T3 verdict wins', r.source === 'supervisor' && r.escalated === true && cloudCalls === 1 && r.verdict.skill === 'scaffold-express-api', JSON.stringify(r));
+      check('escalation recorded with frontier attempts', typeof r.attempts === 'number' && r.latencyMs >= 0);
+    }
+    // 21c. threshold comes from POLICY — exact boundary behavior
+    {
+      const b85 = new SupervisorBridge({ apiKey: 'k', fetchImpl: async () => t2Verdict(0.85)(), sleep: async () => {} });
+      const r85 = await b85.routeTask(payloadFor(b85), []);
+      const b84 = new SupervisorBridge({ apiKey: 'k', fetchImpl: async (url) => (String(url).includes('11434') ? t2Verdict(0.84)() : t3Verdict()), sleep: async () => {} });
+      const r84 = await b84.routeTask(payloadFor(b84), []);
+      check('boundary: 0.85 stays local, 0.84 escalates (POLICY.TIER2_ESCALATE_BELOW_CONFIDENCE)', r85.source === 'tier2-local' && r85.escalated === undefined && r84.source === 'supervisor' && POLICY.TIER2_ESCALATE_BELOW_CONFIDENCE === 0.85);
+    }
+    // 21d. missing confidence NEVER escalates (legacy shapes stay free)
+    {
+      let cloudCalls = 0;
+      const b = new SupervisorBridge({ apiKey: 'k', fetchImpl: async (url) => { if (!String(url).includes('11434')) cloudCalls += 1; return { ok: true, status: 200, json: async () => ({ message: { content: '{"verdict":"delegate","skill":"api-route-map","inject":true}' } }) }; }, sleep: async () => {} });
+      const r = await b.routeTask(payloadFor(b), []);
+      check('missing confidence field → trusted locally (no cost detonation)', r.source === 'tier2-local' && cloudCalls === 0);
+    }
+    // 21e. escalation failure degrades to the borderline LOCAL verdict (never dead)
+    {
+      let cloudCalls = 0;
+      const b = new SupervisorBridge({ apiKey: 'k', fetchImpl: async (url) => { if (String(url).includes('11434')) return t2Verdict(0.6)(); cloudCalls += 1; return { ok: false, status: 429, headers: { get: () => '0' }, text: async () => 'rl' }; }, sleep: async () => {} });
+      const r = await b.routeTask(payloadFor(b), []);
+      check('T3 down → borderline local verdict still serves', r.source === 'tier2-local' && r.escalated === true && !!r.escalationFailed && r.verdict.skill === 'api-route-map' && cloudCalls >= 1, JSON.stringify(r.escalationFailed));
+    }
+    // 21f. T1 is exempt — its synthetic confidence never triggers escalation
+    {
+      let cloudCalls = 0;
+      const b = new SupervisorBridge({ apiKey: 'k', fetchImpl: async (url) => { if (!String(url).includes('11434')) cloudCalls += 1; return t3Verdict(); }, sleep: async () => {} });
+      const task = b.buildRequestPayload({ workerId: 'w', taskKind: 'k', taskSummary: 'please scaffold something for me', skillsCatalog: ['scaffold-express-api'] });
+      const r = await b.routeTask(task, [{ name: 'scaffold-express-api', triggers: ['scaffold'] }]);
+      check('T1 single-trigger match (synthetic 0.7) stays tier1', r.source === 'tier1-template' && cloudCalls === 0, JSON.stringify(r.verdict));
     }
   }
 
