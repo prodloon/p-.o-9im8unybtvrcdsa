@@ -49,6 +49,20 @@ fn daisy_find_project_root() -> Option<PathBuf> {
     None
 }
 
+/// Runtime root where TELEMETRY DATA lives. In app mode the bundle is
+/// read-only, so the backend's data is redirected (DAISY_DATA_DIR) to
+/// Application Support — the emit loop and outage watcher must read from
+/// there too, never from the bundle. Dev mode reads the dev tree as before.
+fn daisy_data_root(root: &PathBuf) -> PathBuf {
+    if root.join("Contents").exists() || root.to_string_lossy().contains("Resources/appdata") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let appdata = PathBuf::from(home).join("Library/Application Support/DaisyCluster");
+            return appdata; // backend create_dir_all's database/ on spawn
+        }
+    }
+    root.clone()
+}
+
 /// Load KEY=VALUE pairs from `<root>/.env` into the child environment map
 /// (existing env entries win — explicit exports take precedence).
 fn load_env_file(root: &PathBuf, envs: &mut Vec<(String, String)>) {
@@ -130,6 +144,25 @@ fn read_telemetry(root: &PathBuf) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
+/// Best-effort macOS notification for telemetry outages (app-mode twin of the
+/// telemetry-server watcher's notifyOutage; DAISY_ALERT=0 silences upstream —
+/// the println log line always fires). Must never block or crash the shell.
+fn notify_outage(msg: &str, urgent: bool) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let sound = if urgent { " sound name \"Basso\"" } else { "" };
+    let script = format!(
+        "display notification \"{}\" with title \"Daisy telemetry\"{}",
+        msg.replace('"', "\\\""),
+        sound
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn();
+}
+
 fn main() {
     tauri::Builder::default()
         // Single-instance: a second launch focuses the existing window instead
@@ -147,12 +180,111 @@ fn main() {
             let child = spawn_backend();
             *app.state::<BackendHandle>().0.lock().unwrap() = child;
 
-            // 2. Telemetry emit loop (native IPC, 1 Hz).
+            // 2. Telemetry emit loop (native IPC, 1 Hz) + outage watcher.
+            // In app mode the shell tails telemetry.json itself — there is no
+            // telemetry-server process — so THIS loop is what notices a frozen
+            // feed and pings, mirroring backend/telemetry-server.js's watcher
+            // (same edges: alert on freeze incl. missing file, one recovery
+            // ping with duration, silent on boot-time unknown→healthy,
+            // edge-triggered so a sustained outage notifies once).
             thread::spawn(move || {
                 let root = daisy_find_project_root();
+                // Data lives in Application Support in app mode — reading the
+                // bundle's (excluded) database/ meant the watcher alerted on a
+                // path that never exists and the UI never got telemetry://metrics.
+                let data_root = root.as_ref().map(daisy_data_root);
+                let tel_path = data_root
+                    .as_ref()
+                    .map(|r| r.join("database").join("telemetry.json"));
+                let mut announced_emit = false;
+                let stale_secs: u64 = std::env::var("DAISY_STALE_NOTIFY_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|ms| (ms / 1000).max(1))
+                    .unwrap_or(10);
+                let silenced = std::env::var("DAISY_ALERT").ok().as_deref() == Some("0");
+                let mut feed_state: u8 = 0; // 0 unknown · 1 healthy · 2 stale
+                let mut stale_since: Option<std::time::Instant> = None;
                 loop {
-                    if let Some(r) = &root {
+                    if let Some(tp) = &tel_path {
+                        let age: Option<Option<u64>> = fs::metadata(tp)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .map(|m| m.elapsed().ok().map(|d| d.as_secs()));
+                        let next = match age {
+                            Some(Some(a)) if a < stale_secs => 1u8,
+                            _ => 2u8, // missing or frozen
+                        };
+                        if next != feed_state {
+                            if next == 2 {
+                                // APP-MODE BOOT RULE: the app starts after
+                                // arbitrary gaps, so a stale or missing file at
+                                // boot usually means "the app was closed" — not
+                                // an outage. Only degradation observed LIVE (a
+                                // transition FROM a seen-healthy state) may
+                                // alert; boot-time unknown→stale stays silent.
+                                if feed_state == 1 {
+                                    // Backdate the freeze start by the observed
+                                    // age: the freeze actually began ~age ago,
+                                    // so the recovery ping reports an honest
+                                    // outage length instead of alert→now.
+                                    stale_since = Some(
+                                        std::time::Instant::now()
+                                            .checked_sub(std::time::Duration::from_secs(
+                                                age.flatten().unwrap_or(stale_secs),
+                                            ))
+                                            .unwrap_or_else(std::time::Instant::now),
+                                    );
+                                    let why = match age {
+                                        None => "telemetry file missing".to_string(),
+                                        _ => format!(
+                                            "orchestrator snapshot frozen {}s",
+                                            age.flatten().unwrap_or(stale_secs)
+                                        ),
+                                    };
+                                    println!("[shell] ALERT: {} — orchestrator down?", why);
+                                    if !silenced {
+                                        notify_outage(
+                                            &format!(
+                                                "{} — orchestrator down? supervisor should heal within a tick",
+                                                why
+                                            ),
+                                            true,
+                                        );
+                                    }
+                                }
+                            } else if feed_state == 2 && stale_since.is_some() {
+                                // recovery only from an ACTUAL outage —
+                                // stale_since is set exactly when we alert, so a
+                                // silent boot-time unknown→stale flip (missing
+                                // file) can never produce a bogus "outage lasted
+                                // ~0s" when the first snapshot lands.
+                                let dur = stale_since
+                                    .map(|s| s.elapsed().as_secs())
+                                    .unwrap_or(0);
+                                println!("[shell] orchestrator back — outage lasted ~{}s", dur);
+                                if !silenced {
+                                    notify_outage(
+                                        &format!("orchestrator back — outage lasted ~{}s", dur),
+                                        false,
+                                    );
+                                }
+                                stale_since = None;
+                            }
+                            feed_state = next;
+                        }
+                    }
+                    if let Some(r) = &data_root {
                         if let Some(snapshot) = read_telemetry(r) {
+                            if !announced_emit {
+                                // One-time proof line: the emit loop is actually
+                                // reading the live data dir (was the silent bug).
+                                println!(
+                                    "[shell] telemetry emit loop live: {:?}",
+                                    r.join("database").join("telemetry.json")
+                                );
+                                announced_emit = true;
+                            }
                             use tauri::Emitter;
                             let _ = handle.emit("telemetry://metrics", snapshot);
                         }

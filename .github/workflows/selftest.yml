@@ -22,6 +22,14 @@ on:
 #
 # No OPENROUTER_API_KEY needed: suite 2 blanks it by design and suite 3's
 # end-to-end task is file-io.
+#
+# The second job builds the real installer with NO_APP_VERIFY=1 (stage 5
+# launches the installed app — no GUI on runners) so payload regressions —
+# missing staged modules, broken wiring, a binary without the shell's proof
+# line — fail CI, not the next local build. It mirrors the selftest job's
+# toolchain steps; runs in PARALLEL (no needs) so the two signals stay
+# independent — a payload break shouldn't be masked by, or wait behind, an
+# unrelated battery failure.
 
 jobs:
   selftest:
@@ -108,3 +116,83 @@ jobs:
           echo "::group::telemetry.log (tail)"
           tail -50 logs/telemetry.log 2>/dev/null || echo "(no telemetry.log)"
           echo "::endgroup::"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Installer build (payload regression gate). Mirrors the toolchain steps of
+  # the selftest job above. Stage 5 of make-installer.sh is skipped here
+  # (NO_APP_VERIFY=1): it launches the installed app, which needs a GUI
+  # session — the static payload checks below substitute on CI.
+  # ──────────────────────────────────────────────────────────────────────────
+  installer:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node (>=26 for node:sqlite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Pin node at /usr/local/bin/node (make-installer.sh hardcodes it)
+        run: |
+          set -euo pipefail
+          NODE_BIN="$(command -v node)"
+          sudo mkdir -p /usr/local/bin
+          if [ -e /usr/local/bin/node ] && [ ! -L /usr/local/bin/node ]; then
+            sudo mv /usr/local/bin/node /usr/local/bin/node.pre-daisy
+          fi
+          sudo ln -sf "$NODE_BIN" /usr/local/bin/node
+          /usr/local/bin/node --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Stage 1 runs tauri build, whose beforeBuildCommand builds the UI —
+      # both need ui/node_modules (tauri CLI + vite). Lockfile is tracked.
+      - name: Install dashboard deps
+        run: |
+          cd ui
+          npm ci --no-audit --no-fund
+
+      - name: Build installer (stages 1–4, stage 5 skipped headless)
+        run: NO_APP_VERIFY=1 ./make-installer.sh
+
+      # What stage 5 would prove on a GUI machine, asserted statically here:
+      # the app-mode resolver modules are staged, the orchestrator is wired
+      # to them, and the binary embeds the shell's emit-loop proof line.
+      - name: Verify bundle payload
+        run: |
+          set -euo pipefail
+          APP="/Applications/Daisy Cluster.app"
+          APPDATA="$APP/Contents/Resources/appdata"
+          codesign --verify --deep --strict "$APP"
+          for f in backend/index.js backend/supervisor-root.js \
+                   backend/supervisor-log-parser.js backend/backend.selftest.js \
+                   skillbase/index.json; do
+            test -f "$APPDATA/$f" || { echo "✗ missing $f"; exit 1; }
+          done
+          grep -q "resolveSupervisorRoot" "$APPDATA/backend/index.js"
+          grep -q "rootSource" "$APPDATA/backend/index.js"
+          grep -q "S18" "$APPDATA/backend/backend.selftest.js"
+          grep -q "telemetry emit loop live" "$APP/Contents/MacOS/daisy-cluster"
+          echo "✔ payload verified: modules staged, wiring present, proof line in binary"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daisy-cluster-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: ignore
+          retention-days: 7

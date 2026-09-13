@@ -238,7 +238,7 @@ suite('S8: real system RAM reader sanity');
 {
   const { systemRamReader } = require('./governor');
   const r = systemRamReader();
-  check('totalBytes near 16 GiB', Math.abs(r.totalBytes - 16 * 1024 ** 3) < 512 * 1024 ** 2, `${(r.totalBytes / 1024 ** 3).toFixed(2)} GiB`);
+  check('totalBytes matches the OS-reported RAM', Math.abs(r.totalBytes - os.totalmem()) < 512 * 1024 ** 2, `${(r.totalBytes / 1024 ** 3).toFixed(2)} GiB (os.totalmem ${(os.totalmem() / 1024 ** 3).toFixed(2)} GiB)`);
   check('usedBytes is a sane positive number', r.usedBytes > 0 && r.usedBytes < r.totalBytes, `${(r.usedBytes / 1024 ** 3).toFixed(2)} GiB used`);
   const pct = (r.usedBytes / r.totalBytes) * 100;
   check('computed pct in range', pct > 0 && pct < 100, `${pct.toFixed(1)}%`);

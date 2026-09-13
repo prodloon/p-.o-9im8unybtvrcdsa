@@ -47,6 +47,12 @@ const POLICY = {
   OLLAMA_MAX_TOKENS: 220,
   // Tier 3: frontier brain via OpenRouter — exclusive, no cloud fallback
   TIER3_MODEL: '~anthropic/claude-sonnet-latest', // PINNED — live-verified alias, no env override
+  // Confidence-score dynamic escalation: the T2 triage self-assesses every
+  // verdict; a BORDERLINE one (below this floor) is re-asked at the frontier
+  // instead of being trusted blindly. Applies to T2 ONLY — T1's confidence
+  // is synthetic (trigger-count) and its gate is the unambiguous-winner rule;
+  // a missing confidence field NEVER escalates (legacy shapes stay free).
+  TIER2_ESCALATE_BELOW_CONFIDENCE: 0.85,
   // --- Rate card for the cost rollup (measured live 2026-09-12) -----------
   // Pinned T3 list price: $2/M prompt, $10/M completion (OpenRouter catalog).
   // One real consult measured 286 prompt + 40 completion tokens →
@@ -286,7 +292,22 @@ class SupervisorBridge {
     if (this.tier2) {
       const t2verdict = await this._askTier2(task);
       if (t2verdict) {
-        return { source: 'tier2-local', model: this.tier2.model, verdict: t2verdict, attempts: 0, latencyMs: this.clock() - t0 };
+        const conf = typeof t2verdict.confidence === 'number' ? t2verdict.confidence : null;
+        const borderline = conf !== null && conf < POLICY.TIER2_ESCALATE_BELOW_CONFIDENCE;
+        if (!borderline) {
+          return { source: 'tier2-local', model: this.tier2.model, verdict: t2verdict, attempts: 0, latencyMs: this.clock() - t0 };
+        }
+        // Borderline local verdict — buy certainty at the frontier.
+        console.log(`[bridge] tier2 confidence ${conf} < ${POLICY.TIER2_ESCALATE_BELOW_CONFIDENCE} — escalating to tier3`);
+        const res = await this.getVerdict(task);
+        if (res.ok) {
+          return { source: 'supervisor', model: res.model, verdict: res.verdict, attempts: res.attempts, latencyMs: this.clock() - t0, escalated: true };
+        }
+        // Frontier unavailable: the borderline LOCAL verdict is still the
+        // best free decision available — degrade to it rather than burning
+        // a real model verdict to the keyword snipe (which may match nothing
+        // and fail the SNIPE gate outright).
+        return { source: 'tier2-local', model: this.tier2.model, verdict: t2verdict, attempts: res.attempts || 0, latencyMs: this.clock() - t0, escalated: true, escalationFailed: res.error || 'tier3 unavailable' };
       }
     }
 

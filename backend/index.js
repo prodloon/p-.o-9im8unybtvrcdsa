@@ -30,7 +30,9 @@ const { Governor, POLICY: GOV_POLICY, readProcessStats } = require('../governor/
 const { WorkerPool } = require('./worker-pool');
 const { SupervisorBridge } = require('./supervisor-bridge');
 const { parseSupervisorLog } = require('./supervisor-log-parser');
+const { resolveSupervisorRoot } = require('./supervisor-root');
 const { SkillInjector } = require('./skill-injector');
+const { KeyHealthMonitor } = require('./key-health');
 
 const ORCH_POLICY = {
   TICK_MS: 2000,           // governor watchdog cadence (matches knowledge.md)
@@ -69,6 +71,9 @@ class Orchestrator {
       skillbaseDir: opts.skillbaseDir || path.join(this.root, 'skillbase'),
       governor: this.governor,
     });
+    // OpenRouter key health (dashboard badge). Own interval loop — NEVER a
+    // network probe inside the 1 Hz telemetry path. Injectable for tests.
+    this.keyHealth = opts.keyHealth || new KeyHealthMonitor(opts.keyHealthOpts || {});
     this._catalogCache = { at: 0, names: null };
     this._cycle = 0;
     // 3-Tier cascade accounting (telemetry + dashboard pipeline panel)
@@ -124,7 +129,7 @@ class Orchestrator {
       const outcome = this.injector.applyVerdict(routed.verdict, worker.id, task.id, src);
       if (outcome.injected) {
         this._tiers[src] = (this._tiers[src] || 0) + 1;
-        this._lastTier = { source: src, model: routed.model, latencyMs: routed.latencyMs };
+        this._lastTier = { source: src, model: routed.model, latencyMs: routed.latencyMs, escalated: routed.escalated === true || undefined };
         if (this.verbose) console.log(`[orch] task ${task.id} → ${src} (${routed.model}) in ${routed.latencyMs}ms`);
         return outcome;
       }
@@ -237,6 +242,8 @@ class Orchestrator {
   /** Long-running mode. */
   async serve() {
     if (this.verbose) console.log(`[orch] serving — tick ${this.tickMs}ms, target fleet ${this.pool.targetSize}`);
+    // Key-health probe loop (no-op without an API key; unref'd timer).
+    this.keyHealth.start();
     // Orphan guard (app-bundle backend only): when the Tauri shell dies
     // abnormally (kill -9, AppleScript quit bypassing the child-reaper),
     // the backend would linger as a duplicate orchestrator fighting over
@@ -274,6 +281,18 @@ class Orchestrator {
   }
 
   /**
+   * Where the supervisor (scripts/cluster.sh under launchd) actually lives.
+   * In app mode that is the operator's checkout, NOT this.root — the bundle
+   * has no logs/ and its database/ is redirected. Resolution rules and
+   * source labels: backend/supervisor-root.js. Memoized (env is fixed at
+   * spawn, so the answer cannot change mid-process).
+   */
+  _supervisorRoot() {
+    if (!this._supRootCache) this._supRootCache = resolveSupervisorRoot(this.root);
+    return this._supRootCache;
+  }
+
+  /**
    * Recent supervisor heal/halt events, parsed from the LaunchAgent log
    * (logs/launchd-agent.log) via backend/supervisor-log-parser.js (pure,
    * S17-tested). Lines written by the current cluster.sh carry real
@@ -288,7 +307,7 @@ class Orchestrator {
     let parsed = { events: [], eras: { timestamped: 0, legacy: 0 } };
     let logAge = null;
     try {
-      const logPath = path.join(this.root, 'logs', 'launchd-agent.log');
+      const logPath = path.join(this._supervisorRoot().root, 'logs', 'launchd-agent.log');
       const raw = fs.readFileSync(logPath, 'utf8');
       logAge = Math.round((Date.now() - fs.statSync(logPath).mtimeMs) / 1000);
       parsed = parseSupervisorLog(raw);
@@ -301,6 +320,7 @@ class Orchestrator {
       logAge,
       hasLegacy: parsed.eras.legacy > 0,
       hasTimestamps: parsed.eras.timestamped > 0,
+      rootSource: this._supervisorRoot().source,
     };
     return this._evCache;
   }
@@ -312,7 +332,7 @@ class Orchestrator {
    * this runs inside the 1 Hz telemetry path.
    */
   _supervisorGuard() {
-    const runDir = path.join(this.root, '.run');
+    const runDir = path.join(this._supervisorRoot().root, '.run');
     const now = Date.now();
     if (!this._supCheckAt || now - this._supCheckAt > 5000) {
       try {
@@ -372,6 +392,8 @@ class Orchestrator {
       supervisor: this._supervisorGuard(),
       // Recent supervisor events (dashboard heal strip) + log freshness
       supervisorEvents: this._supervisorEvents(),
+      // OpenRouter key health (dashboard badge) — masked, never the key itself
+      keyHealth: this.keyHealth.snapshot(),
     };
   }
 
