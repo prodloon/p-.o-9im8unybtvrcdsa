@@ -25,3 +25,8 @@ ui/dist/
 # macOS
 .DS_Store
 database/*.tmp
+
+# Runtime artifacts (not part of the repo)
+.vite/
+database/
+orchestrator.log
