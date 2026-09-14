@@ -305,9 +305,9 @@ Added `_recentBurnProjection()` to the orchestrator's `costRollup()` path
 trail) and returns a trailing-hour burn estimate inside `costs.burnProjection`:
 recentWindowUsd, recentWindowConsults, dailyBurnUsd, projectedWeekUsd,
 projectedMonthUsd, and a `method` note. Honesty law: no consults in the
-trailing hour returns a stall signal (`dailyBurnUsd: 0`, `staleAt` set) rather than
-projecting from ancient data. Same audit-trail source as the all-time rollup,
-no separate trend DB.
+trailing hour returns a stall signal (`dailyBurnUsd: 0`, `staleAt` set) rather
+than projecting from ancient data. Same audit-trail source as the all-time
+rollup, no separate trend DB.
 
 Found and fixed a wiring bug on the way: the backend emitted `costs.burnProjection`,
 but the dashboard read `sample?.burnProjection` (top-level, missing). Fixed
@@ -321,6 +321,7 @@ HOUR): 0 · quiet right now" because the audit trail's newest event is from
 :6292 + vite dashboard :5183 + backend orchestrator all green; .env carries
 the rotated OPENROUTER_API_KEY (masked, never in source).
 
-Note: the backend battery (S23 = 185) does not yet have a _recentBurnProjection
+Note: the backend battery (S23 = 185) doesn't yet have a `_recentBurnProjection`
 suite; the python battery (76/76) is unaffected. Leave the pin bump to a
 follow-up if it matters.
+
