@@ -297,3 +297,31 @@ Rules every sub-agent must respect:
 - 2026-09-12: SECRET LEAK DETECTION shipped (scripts/scan-secrets.js, S23 = 20 checks, battery 164→185) — and it caught a REAL leak on live fire: the LIVE OpenRouter key was hardcoded as the S20 fixture (`ROTATION_KEY`) in backend.selftest.js — introduced in `6c1e0fb` (the key-health commit), merged to origin/main via PR #1, baked into the v1.1-key-health tag and the installed app's bundle source. Exposure window ≈ the push→revocation gap (pushed 01:46Z, revoked same day; $0-credit free-tier account bounds the abuse surface, but treat as exposed). EXPOSURE SCOPE: 8 historical blobs (6c1e0fb→fe12c27), all reachable from origin/main + the release tag; the repo's GitHub remote is the only place this history exists. Remediation (user decision): (1) ROTATE at openrouter.ai — the load-bearing fix, history rewrite changes nothing about a live key; (2) optionally `git filter-repo` + force-push + re-tag (rewrites every descendant SHA incl. the release tag and the CI-proven delivery history). SCANNER: zero-dep, pure `findSecrets(text)` (7 detectors: openrouter-key, generic-sk-, ghp_/gh[sou]_, xox-, AKIA, PEM blocks, key-assignment literals), findings MASKED in all output (a leak scanner that prints the leak would be a leak), `MASKED_ALLOW` = the repo's ellipsis-fingerprint idiom is structurally unmatchable AND explicitly allowlisted, scope = git TRACKED files only (.env gitignored by design is the one legal home for the real key), exit 1 on findings → also a CI gate step in selftest.yml (schema-asserted via ruby + YAML.safe_load with a jobs-Hash/step-name check — pyyaml absent on this box; LESSON: `ruby -e` one-liners die on em-dashes under US-ASCII default). FIX: fixture key rebuilt from string fragments (runtime-only full shape — the scanner cannot tell synthetic from real and must never have to); fingerprint checks made STRUCTURAL (assert head12+…+tail4 of whatever fixture key exists, not hardcoded fragments of the old real key). THREE DOCTRINE LESSONS the suite taught its own author: (1) S23's self-scan check (the battery scans its own source) caught my test literals TWICE — key strings, then a PEM header literal — full-shape secret shapes never belong in source, fixtures included: build from fragments; (2) the 32-char min-length boundary bit me twice writing leak fixtures (a too-short "leak" silently passes — write fixtures at real shape); (3) a scanner that exempted "synthetic-looking" keys would be the exact loophole real leaks hide behind. AUDIT VERDICT of the 100-item hardening menu: most items already exist here in stronger form (backoff+jitter, DLQ via task_queue attempts, health probes via supervisor+S22, confidence escalation, drift alarms); several premises don't match this stack (cgroups/seccomp/pid-namespaces are Linux-only — this box is macOS; zero-copy rings moot for 2KB loopback verdicts; Merkle workspace checkpoints duplicate what git already is); item 25 was the one urgent gap — because the gap was live.
 6. **Open item needing user input later:** which OpenRouter model to pin as Supervisor (capability vs cost). Default proposal: a strong cheap model for routine verdicts + escalation path for hard audits.
 7. **Open item needing user action NOW (2026-09-12 secret leak):** rotate the OpenRouter key at openrouter.ai — the live key sat hardcoded in backend.selftest.js from `6c1e0fb` until the S23 fix, across 8 blobs reachable from origin/main and the v1.1-key-health tag. Rotation is the load-bearing fix; history rewrite (git filter-repo + force-push + re-tag) is optional cleanup that changes nothing about a live key. Until rotated, treat the key as public.
+
+### 2026-09-13 — daily burn estimate panel + wiring fix
+
+Added `_recentBurnProjection()` to the orchestrator's `costRollup()` path
+(backend/index.js:445). The method reads `skill_events` (the permanent audit
+trail) and returns a trailing-hour burn estimate inside `costs.burnProjection`:
+recentWindowUsd, recentWindowConsults, dailyBurnUsd, projectedWeekUsd,
+projectedMonthUsd, and a `method` note. Honesty law: no consults in the
+trailing hour returns a stall signal (`dailyBurnUsd: 0`, `staleAt` set) rather
+than projecting from ancient data. Same audit-trail source as the all-time
+rollup, no separate trend DB.
+
+Found and fixed a wiring bug on the way: the backend emitted `costs.burnProjection`,
+but the dashboard read `sample?.burnProjection` (top-level, missing). Fixed
+ui/src/App.jsx:435 to read `proj={sample?.costs?.burnProjection}`. Two orchestrator
+restarts later (one to pick up the backend edit, one to confirm), the panel
+renders from live data.
+
+Live state (2026-09-13 ~15:35 PDT): dashboard shows "BURN ESTIMATE (TRAILING
+HOUR): 0 · quiet right now" because the audit trail's newest event is from
+01:13:19 (over 14h old). That's the correct stall signal. Telemetry server
+:6292 + vite dashboard :5183 + backend orchestrator all green; .env carries
+the rotated OPENROUTER_API_KEY (masked, never in source).
+
+Note: the backend battery (S23 = 185) doesn't yet have a `_recentBurnProjection`
+suite; the python battery (76/76) is unaffected. Leave the pin bump to a
+follow-up if it matters.
+
