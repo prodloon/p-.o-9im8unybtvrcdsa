@@ -35,7 +35,7 @@ if [ -z "$VERIFY_ONLY" ]; then
 
 if [ "${1:-}" != "--skip" ]; then
   echo "▶ 1/5 tauri build (release; takes minutes)…"
-  npx --prefix "$ROOT/ui" tauri build 2>&1 | tail -4
+  "$ROOT/ui/node_modules/.bin/tauri" build 2>&1 | tail -4
 else
   echo "▶ 1/5 skipped (--skip)"
 fi

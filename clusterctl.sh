@@ -77,6 +77,24 @@ alive()        { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
 shell_is_up() { alive "$(shell_pid)"; }
 
+cmd_dashboard() {
+  # Standalone dashboard spawn (for the dashboard LaunchAgent, or manual
+  # start when the orchestrator is already up). Uses the same python
+  # spawner as cmd_start so the child survives terminal/tool timeouts.
+  if [ -n "$(vite_pid)" ]; then
+    ok "dashboard already up (pid $(vite_pid)) → http://localhost:$UI_PORT"
+    return 0
+  fi
+  [ -d ui/node_modules ] || (cd ui && npm install --no-audit --no-fund --loglevel=error >>"$LOGDIR/vite.log" 2>&1)
+  spawn vite "$PIDDIR/vite.pid" "$LOGDIR/vite.log" npm run dev --prefix ui
+  if wait_http "http://localhost:$UI_PORT/" 25; then
+    ok "dashboard up → http://localhost:$UI_PORT"
+  else
+    warn "dashboard slow or failed — check logs/vite.log"
+    return 1
+  fi
+}
+
 # True orchestrator health = its 1 Hz telemetry write loop is alive
 # (telemetry.json modified within the last 10s), not a borrowed endpoint.
 orch_healthy() {
@@ -289,7 +307,7 @@ cmd_status() {
   # live telemetry glance (repo stack)
   local tel
   tel=$(curl -sf -m 2 "http://127.0.0.1:$TELEMETRY_PORT/api/telemetry" 2>/dev/null) && \
-    echo "$tel" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d);console.log('  live: cycle '+t.cycle+' · ram '+t.ramPct+'% · agents '+(t.pool?t.pool.size:'?')+' · queue pending '+(t.queue?t.queue.pending:'?')+' · data database/')}catch{}})" 2>/dev/null
+    echo "$tel" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d);console.log('  live: cycle '+t.cycle+' · ram '+t.ramPct+'% · agents '+(t.pool?t.pool.size:'?')+' · queue pending '+(t.queue?t.queue.pending:'?')+' · burn '+((t.costs&&t.costs.burnProjection)?t.costs.burnProjection.dailyBurnUsd:'?')+'/day')}catch{}})" 2>/dev/null
 
   # ── INSTALLED APP — a second, fully independent runtime ─────────────────
   # Separate code (bundle payload), separate data (Application Support),
@@ -382,13 +400,88 @@ doctor_raw() { # doctor_raw — status-side probes (live, no header/foot)
   echo "SPOKEN_TIER2=$(test -f "$ROOT/database/telemetry.json" && python3 -c "import json,os;try:print(next((e.get('meta',{}).get('tier2Spoken') or 0) for e in list(reversed(json.load(open('$ROOT/database/telemetry.json')).skill_events)) if e.get('kind') in ('tier2','tier2-rejected') and e.get('meta',{}).get('tier2Spoken')));except:print(0)" 2>/dev/null || echo '?')"
 }
 
+# --- Dashboard login autostart -----------------------------------------------
+DASHBOARD_AGENT_LABEL="com.daisy.cluster.dashboard"
+DASHBOARD_AGENT_PLIST="$HOME/Library/LaunchAgents/$DASHBOARD_AGENT_LABEL.plist"
+
+write_dashboard_agent_plist() {
+  cat > "$DASHBOARD_AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${DASHBOARD_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${ROOT}/clusterctl.sh</string>
+    <string>dashboard</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>WorkingDirectory</key><string>${ROOT}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StandardOutPath</key><string>${ROOT}/logs/dashboard-agent.log</string>
+  <key>StandardErrorPath</key><string>${ROOT}/logs/dashboard-agent.log</string>
+</dict>
+</plist>
+PLIST
+}
+
+cmd_install_dashboard_agent() {
+  local unload_first=0
+  [ "${1:-}" = "--unload-first" ] && unload_first=1
+  mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/logs"
+  if launchctl print "gui/$(id -u)/$DASHBOARD_AGENT_LABEL" >/dev/null 2>&1; then
+    if [ "$unload_first" = "1" ]; then
+      log "dashboard agent already loaded — unloading first (--unload-first)"
+      cmd_uninstall_dashboard_agent --keep-running >/dev/null 2>&1 || true
+    else
+      log "dashboard agent already loaded — nothing to do (use --unload-first to reload)"
+      return 0
+    fi
+  fi
+  log "writing $DASHBOARD_AGENT_PLIST"
+  write_dashboard_agent_plist
+  if ! plutil -lint "$DASHBOARD_AGENT_PLIST" >/dev/null; then fail "generated plist failed lint"; exit 2; fi
+  ok "plist lint passed"
+  log "loading dashboard agent (bootstrap gui/$(id -u)) — vite will spawn at login"
+  if ! launchctl bootstrap "gui/$(id -u)" "$DASHBOARD_AGENT_PLIST" 2>/dev/null; then
+    fail "bootstrap failed (see $ROOT/logs/dashboard-agent.log)"
+    exit 2
+  fi
+  sleep 6
+  cmd_status | grep -A1 "dashboard-agent" || true
+  log "dashboard is login-autostart — close the browser tab any time; it re-opens at next login"
+}
+
+cmd_uninstall_dashboard_agent() {
+  local keep=0
+  [ "${1:-}" = "--keep-running" ] && keep=1
+  if launchctl print "gui/$(id -u)/$DASHBOARD_AGENT_LABEL" >/dev/null 2>&1; then
+    log "booting out dashboard agent (does NOT kill a running vite)"
+    launchctl bootout "gui/$(id -u)/$DASHBOARD_AGENT_LABEL" 2>/dev/null || true
+    ok "dashboard autostart removed"
+  else
+    log "dashboard agent not loaded"
+  fi
+  [ -f "$DASHBOARD_AGENT_PLIST" ] && rm -f "$DASHBOARD_AGENT_PLIST" && ok "dashboard plist removed"
+  :
+}
+
 case "${1:-help}" in
-  doctor) clusterctl_doctor ;;
-  start)   shift; cmd_start "$@" ;;
-  stop)    cmd_stop ;;
-  restart) shift; cmd_stop; cmd_start "$@" ;;
-  status)  cmd_status ;;
-  logs)    shift; cmd_logs "$@" ;;
-  task)    shift; cmd_task "$@" ;;
+  doctor)       clusterctl_doctor ;;
+  start)        shift; cmd_start "$@" ;;
+  stop)         cmd_stop ;;
+  restart)      shift; cmd_stop; cmd_start "$@" ;;
+  status)       cmd_status ;;
+  logs)         shift; cmd_logs "$@" ;;
+  task)         shift; cmd_task "$@" ;;
+  dashboard)           cmd_dashboard ;;
+  install-dashboard-agent)  shift; cmd_install_dashboard_agent "$@" ;;
+  uninstall-dashboard-agent) shift; cmd_uninstall_dashboard_agent "$@" ;;
   *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
