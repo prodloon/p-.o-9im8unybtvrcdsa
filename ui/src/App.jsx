@@ -191,7 +191,7 @@ const AgentTable = React.memo(function AgentTable({ workers, hostStats, perWorke
 });
 
 /** 3-Tier cascade pipeline: per-cycle tier distribution + model pins + last route + cost rollup. */
-function CascadePanel({ cascade, costs }) {
+function CascadePanel({ cascade, costs, proj = null }) {
   const tiers = cascade?.tiers || {};
   const last = cascade?.lastTier;
   const total = Object.values(tiers).reduce((a, v) => a + (v || 0), 0);
@@ -235,6 +235,25 @@ function CascadePanel({ cascade, costs }) {
           <div className="mt-1 space-y-0.5 text-[11px] text-slate-400">
             <div className="flex justify-between"><span>avoided by T1/T2/fallback ({costs.totals.consults - (costs.perTier?.supervisor?.consults ?? 0)} consults)</span><span className="font-mono text-emerald-400">{fmtUsd(costs.totals.avoidedUsd)}</span></div>
             <div className="flex justify-between"><span>spent at T3 ({costs.perTier?.supervisor?.consults ?? 0} consults × {fmtUsd(costs.unitT3Usd)})</span><span className="font-mono text-slate-300">{fmtUsd(costs.totals.spentUsd)}</span></div>
+          </div>
+          <div className="mt-2 border-t border-slate-700/60 pt-2">
+            <div className="flex items-baseline justify-between text-xs">
+              <span className="text-xs font-medium uppercase tracking-wider text-slate-400">Burn estimate (trailing hour)</span>
+              <span className={`font-mono ${proj.dailyBurnUsd != null ? proj.dailyBurnUsd === 0 ? 'text-slate-400' : 'text-amber-300' : 'text-slate-500'}`}>
+                {proj.dailyBurnUsd != null
+                  ? proj.dailyBurnUsd === 0
+                    ? `0 · quiet right now`
+                    : `≈ $${proj.dailyBurnUsd.toFixed(3)}/day`
+                  : 'stale (no recent consults)'}
+              </span>
+            </div>
+            {proj.dailyBurnUsd != null && proj.dailyBurnUsd > 0 && (
+              <div className="mt-1 text-[11px] text-slate-400">
+                <div className="flex justify-between"><span>this week's pace</span><span className="font-mono text-slate-300">{fmtUsd(proj.projectedWeekUsd)}</span></div>
+                <div className="flex justify-between"><span>this month's pace</span><span className="font-mono text-slate-300">{fmtUsd(proj.projectedMonthUsd)}</span></div>
+                <div className="mt-1 text-[10px] text-slate-500">{fmtUsd(proj.recentWindowUsd)} across {proj.recentWindowConsults} consult{proj.recentWindowConsults === 1 ? '' : 's'} in the last hour</div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -413,7 +432,7 @@ export default function App() {
             </div>
           </div>
         </div>
-        <CascadePanel cascade={sample?.cascade} costs={sample?.costs} />
+        <CascadePanel cascade={sample?.cascade} costs={sample?.costs} proj={sample?.costs?.burnProjection} />
       </div>
 
       <div className="mt-4">

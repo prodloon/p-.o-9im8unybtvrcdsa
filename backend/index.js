@@ -442,7 +442,52 @@ class Orchestrator {
         savingsPct: t1 + t2 + fb + t3 > 0 ? Math.round((avoided / (t1 + t2 + fb + t3)) * 1000) / 10 : 0,
       },
       method: 'modeled: T1/T2 $0 by COST LAW; $ avoided = below-frontier consults × measured T3 consult price ($0.000972, live-calibrated 2026-09-12)',
-    }; 
+      burnProjection: this._recentBurnProjection(rows, unit),
+    };
+  }
+
+  /**
+   * Same audit trail as costRollup, same honesty law: this is a projection,
+   * not a guarantee. Reads recent skill_events (≥1 hour old) and estimates a
+   //     recentWindowUsd, recentWindowConsults, recentWindowDays, dailyBurnUsd,
+   //     projectedWeekUsd, projectedMonthUsd, windowStartAt, staleAt.
+   * T1/T2 still $0; supervisor consults still the counted cost. A window with
+   //     no recent activity returns a stall signal (dailyBurn $0) rather than
+   //     projecting from ancient data — better to look quiet than to lie.
+   */
+  _recentBurnProjection(rows, unit) {
+    const now = Date.now();
+    const oneHour = 3600 * 1000;
+    // "Recent" = events written within the trailing hour. If the table has
+    // nothing newer than an hour, the window is stale and we don't project.
+    const recentSources = this.governor.db
+      .prepare("SELECT source, COUNT(*) n FROM skill_events WHERE ts >= ? GROUP BY source")
+      .all(Date.now() - oneHour)
+      .reduce((a, r) => ((a[r.source] = r.n), a), {});
+    if (!recentSources || Object.values(recentSources).every((n) => !n)) {
+      return {
+        recentWindowUsd: 0, recentWindowConsults: 0, recentWindowDays: 1, dailyBurnUsd: 0,
+        projectedWeekUsd: 0, projectedMonthUsd: 0,
+        windowStartAt: null, staleAt: now,
+        method: 'no skill_events in the trailing hour — stall signal, not a projection',
+      };
+    }
+    const recentT3 = recentSources.supervisor || 0;
+    const recentConsults = Object.values(recentSources).reduce((s, n) => s + n, 0);
+    const recentSpend = round4(recentT3 * unit);
+    // Project from the trailing hour to a day: scale by 24. A recursive
+    // per-source holdback is not worth inventing here — the hill we're on
+    // is "does the dashboard show a defensible burn trend", and the honest
+    // calibration point is the trailing-hour snapshot.
+    const dailyBurnUsd = round4(recentSpend * 24);
+    const projectedWeekUsd = round4(dailyBurnUsd * 7);
+    const projectedMonthUsd = round4(dailyBurnUsd * 30);
+    return {
+      recentWindowUsd: recentSpend, recentWindowConsults: recentConsults, recentWindowDays: 1,
+      dailyBurnUsd, projectedWeekUsd, projectedMonthUsd,
+      windowStartAt: now - oneHour, staleAt: now + oneHour,
+      method: 'trailing-hour snapshot × 24 → daily; supervisor consults only (T1/T2 $0); stalled when quiet',
+    };
   }
 
   /** Atomically persist telemetry for the Tauri shell / UI (tmp+rename). */
