@@ -172,14 +172,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-            python3 - <<'EOF'
-            import json
-            p = 'src-tauri/tauri.conf.json'
-            d = json.load(open(p))
-            d['bundle']['createUpdaterArtifacts'] = False
-            json.dump(d, open(p, 'w'), indent=2)
-            print('updater artifacts disabled (no TAURI_SIGNING_PRIVATE_KEY secret)')
-            EOF
+            python3 -c "import json; p='src-tauri/tauri.conf.json'; d=json.load(open(p)); d['bundle']['createUpdaterArtifacts']=False; json.dump(d, open(p,'w'), indent=2); print('updater artifacts disabled (no TAURI_SIGNING_PRIVATE_KEY secret)')"
           fi
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
