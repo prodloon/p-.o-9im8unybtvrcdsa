@@ -1,0 +1,193 @@
+# Daisy Chain CI — full fast battery on every push.
+# ============================================================
+# Runs the complete 8-suite cluster battery (76 checks) with
+# DAISY_SELFTEST_FAST=1: no real-Ollama triage leg, and Suite 5's
+# cargo check targets a persistent cache dir (see
+# daisy_cluster_selftest.py, suite_shell_artifacts).
+#
+# The cache makes Suite 5's first-run cost (~2 min dependency build)
+# a one-time expense; warm runs finish the whole battery in well
+# under a minute on the runner.
+#
+# Notes:
+#   • macOS runner (required: Suite 7's launchctl/plutil checks and the
+#     suite's macOS-only paths; Tauri shell targets macOS).
+#   • The repo stack is started headless (`clusterctl.sh start --no-ui`)
+#     because Suites 3/6/7 exercise the REAL orchestrator and ctl status.
+#     Vite is skipped — no browser transport is needed by the battery.
+#   • Full mode (live-Ollama triage in S14) remains a local pre-release
+#     step, not a CI step.
+
+name: daisy-ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  fast-battery:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      DAISY_SELFTEST_FAST: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain (Suite 5 cargo check)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Persistent cargo target dir — the same path the fast-mode Suite 5
+      # pins via --target-dir. Cached between runs → cargo check is a
+      # no-op rebuild in seconds after the first run.
+      - name: Cache cargo target dir
+        uses: actions/cache@v4
+        with:
+          path: daisy-chain/.ci-cargo-target
+          key: daisy-cargo-${{ runner.os }}-${{ hashFiles('daisy-chain/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            daisy-cargo-${{ runner.os }}-
+
+      - name: Start the stack (headless orchestrator + telemetry)
+        working-directory: daisy-chain
+        run: ./clusterctl.sh start --no-ui
+
+      - name: Run the full fast battery (8 suites, 76 checks)
+        working-directory: daisy-chain
+        run: python3 daisy_cluster_selftest.py
+
+      - name: Stop the stack
+        if: always()
+        working-directory: daisy-chain
+        run: ./clusterctl.sh stop || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daisy-ci-logs
+          path: |
+            daisy-chain/logs/
+            daisy-chain/.run/
+          if-no-files-found: ignore
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Release: on a v* tag, build → sign → notarize → staple the .app AND
+  # the .dmg via make-installer.sh (which owns that whole pipeline), then
+  # attach the stapled DMG to the GitHub release.
+  #
+  # Required repo secrets (Settings → Secrets → Actions):
+  #   APPLE_CERT_P12_BASE64   Developer ID Application cert, base64-encoded
+  #                           .p12 (export from Keychain Access; includes
+  #                           the intermediate if bundled by Apple)
+  #   APPLE_CERT_PASSWORD     the .p12's export password
+  #   KEYCHAIN_PASSWORD       any strong random string (unlocks the CI
+  #                           keychain — not an Apple secret)
+  #   APPLE_KEY_ID            App Store Connect API key ID
+  #   APPLE_ISSUER_ID         App Store Connect API issuer ID
+  #   APPLE_API_KEY_P8_BASE64 App Store Connect API key (.p8, base64)
+  # Apple events (codesign/notarytool) require signing in to the security
+  # keychain — gate the whole job on that secret being present.
+  # ──────────────────────────────────────────────────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: fast-battery          # never ship what the battery just failed
+    runs-on: macos-14
+    timeout-minutes: 60
+    environment: release
+    env:
+      DAISY_SIGN_IDENTITY: "Developer ID Application"
+      DAISY_NOTARY_PROFILE: daisy-notary
+      # Headless runner: stage 5 launches the installed app — impossible in
+      # CI. NO_APP_VERIFY skips it; the fast-battery job already proved the
+      # build. DAISY_ALLOW_EXTRA_BUNDLES: a runner has no preinstalled Daisy
+      # bundles, but the guard also misreads transient /Applications states —
+      # belt-and-braces so a clean runner can never be blocked by it.
+      NO_APP_VERIFY: "1"
+      DAISY_ALLOW_EXTRA_BUNDLES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Release build = a fresh target dir anyway; caching the fast-battery's
+      # check-only dir wouldn't help a release-profile build.
+      - name: Install UI dependencies (tauri beforeBuildCommand needs vite)
+        working-directory: daisy-chain/ui
+        run: npm ci
+
+      # Provision the signing identity in a temporary login keychain. The
+      # codesign security partition step is what suppresses the GUI prompt
+      # that would otherwise hang the headless runner.
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > /tmp/cert.p12
+          KEYCHAIN=/tmp/daisy-release.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -t 3600 "$KEYCHAIN"
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          rm -f /tmp/cert.p12
+
+      # notarytool's keychain profile is built from the ASC API key — the
+      # headless equivalent of the interactive store-credentials setup.
+      - name: Store notary credentials
+        env:
+          APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
+          APPLE_ISSUER_ID: ${{ secrets.APPLE_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > /tmp/AuthKey.p8
+          xcrun notarytool store-credentials daisy-notary \
+            --key-id "$APPLE_KEY_ID" --issuer-id "$APPLE_ISSUER_ID" \
+            --key /tmp/AuthKey.p8
+          rm -f /tmp/AuthKey.p8
+
+      # The full pipeline: tauri build → stage appdata → Developer ID sign
+      # (hardened runtime + allow-jit) → notarize .app + .dmg → staple both →
+      # spctl/stapler gates. Replaces stages 4/5 install+verify with nothing —
+      # on the runner the .app under target/release/bundle is the artifact.
+      - name: Build, sign, notarize, staple
+        working-directory: daisy-chain
+        run: ./make-installer.sh
+
+      - name: Locate the stapled DMG
+        id: dmg
+        working-directory: daisy-chain
+        run: |
+          DMG=$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
+
+      - name: Attach DMG to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.dmg.outputs.path }}
+          fail_on_unmatched_files: true
+
+      - name: Upload notarization logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daisy-release-logs
+          path: |
+            daisy-chain/logs/
+            /tmp/daisy-*.zip
+          if-no-files-found: ignore
