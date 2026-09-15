@@ -76,7 +76,7 @@ NOTARY_PROFILE="${DAISY_NOTARY_PROFILE:-}"
 # you open?". Fail the build early instead. Skippable for exotic setups:
 #   DAISY_ALLOW_EXTRA_BUNDLES=1 ./make-installer.sh
 # ────────────────────────────────────────────────────────────────────────────
-if [ -z "$VERIFY_ONLY" ] && [ "${DAISY_ALLOW_EXTRA_BUNDLES:-0}" != "1" ]; then
+if [ -z "${VERIFY_ONLY:-}" ] && [ "${DAISY_ALLOW_EXTRA_BUNDLES:-0}" != "1" ]; then
   APPS_DIR="${DAISY_APPS_DIR:-/Applications}"
   extras=""
   for candidate in "$APPS_DIR/"*[Dd]aisy*.app "$APPS_DIR/"*[Dd]AISY*.app; do
