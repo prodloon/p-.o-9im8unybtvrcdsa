@@ -47,6 +47,15 @@ export async function subscribeTelemetry(onSample) {
   };
 }
 
+/** Shell alert channel: the Rust host emits `shell://no-node` when no Node
+ *  runtime was found at launch (backend can never spawn). Returns unlisten,
+ *  or null in plain-browser mode where the concept doesn't apply. */
+export async function subscribeShellAlert(onAlert) {
+  if (!isTauri()) return null;
+  const { listen } = await import('@tauri-apps/api/event');
+  return listen('shell://no-node', (event) => onAlert(String(event.payload || '')));
+}
+
 /** Buffer + throttle helper: returns a feed function that commits at most `hz` times/sec. */
 export function createThrottledFeed(onCommit, intervalMs = 500) {
   let buffer = null;

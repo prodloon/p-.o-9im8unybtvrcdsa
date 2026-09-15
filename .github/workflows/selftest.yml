@@ -168,8 +168,27 @@ jobs:
           cd ui
           npm ci --no-audit --no-fund
 
+      - name: Disable updater artifacts if no signing key secret
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            python3 - <<'EOF'
+            import json
+            p = 'src-tauri/tauri.conf.json'
+            d = json.load(open(p))
+            d['bundle']['createUpdaterArtifacts'] = False
+            json.dump(d, open(p, 'w'), indent=2)
+            print('updater artifacts disabled (no TAURI_SIGNING_PRIVATE_KEY secret)')
+            EOF
+          fi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
       - name: Build installer (stages 1–4, stage 5 skipped headless)
         run: NO_APP_VERIFY=1 ./make-installer.sh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       # What stage 5 would prove on a GUI machine, asserted statically here:
       # the app-mode resolver modules are staged, the orchestrator is wired

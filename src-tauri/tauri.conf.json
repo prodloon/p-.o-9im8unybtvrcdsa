@@ -24,7 +24,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE1QjI1QTE4RTNEMjJBNkQKUldSdEt0TGpHRnF5RmNaaXJCZ0xXNHlKTC9MS2l4NFg2RzhyNnFaZ2ZGK3NwUU95ZGFVUm0xR2gK",
       "endpoints": [
         "https://github.com/prodloon/daisy-chain/releases/latest/download/latest.json"
       ]
@@ -33,6 +33,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

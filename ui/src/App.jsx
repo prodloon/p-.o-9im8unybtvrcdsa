@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { subscribeTelemetry, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
+import { subscribeTelemetry, subscribeShellAlert, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
 
 const MAX_HISTORY = 60; // ~60s of samples at 1Hz
 
@@ -266,6 +266,7 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [fetchFailed, setFetchFailed] = useState(false);
   const [history, setHistory] = useState([]);
+  const [shellAlert, setShellAlert] = useState(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const feedRef = useRef(null);
 
@@ -295,6 +296,14 @@ export default function App() {
     };
   }, []);
 
+  // Shell alert: Node missing at launch → backend can never spawn. Show a
+  // persistent banner; everything else on the page will read as dead anyway.
+  useEffect(() => {
+    let unlisten = null;
+    subscribeShellAlert(setShellAlert).then((fn) => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
   // Heartbeat: staleness must be re-evaluated even when NO new samples
   // arrive — during an orchestrator outage the telemetry server still
   // answers with the last snapshot, so `connected` alone would keep the
@@ -321,6 +330,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-900 p-6 text-slate-100">
+      {shellAlert && (
+        <div className="mb-4 flex items-center gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          <span className="text-lg">⚠️</span>
+          <span>{shellAlert}</span>
+        </div>
+      )}
       <header className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">Daisy Cluster</h1>
