@@ -48,22 +48,22 @@ jobs:
       - name: Cache cargo target dir
         uses: actions/cache@v4
         with:
-          path: daisy-chain/.ci-cargo-target
-          key: daisy-cargo-${{ runner.os }}-${{ hashFiles('daisy-chain/src-tauri/Cargo.lock') }}
+          path: .ci-cargo-target
+          key: daisy-cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: |
             daisy-cargo-${{ runner.os }}-
 
       - name: Start the stack (headless orchestrator + telemetry)
-        working-directory: daisy-chain
+        working-directory: .
         run: ./clusterctl.sh start --no-ui
 
       - name: Run the full fast battery (8 suites, 76 checks)
-        working-directory: daisy-chain
+        working-directory: .
         run: python3 daisy_cluster_selftest.py
 
       - name: Stop the stack
         if: always()
-        working-directory: daisy-chain
+        working-directory: .
         run: ./clusterctl.sh stop || true
 
       - name: Upload logs on failure
@@ -72,8 +72,8 @@ jobs:
         with:
           name: daisy-ci-logs
           path: |
-            daisy-chain/logs/
-            daisy-chain/.run/
+            logs/
+            .run/
           if-no-files-found: ignore
 
   # ──────────────────────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ jobs:
       # Release build = a fresh target dir anyway; caching the fast-battery's
       # check-only dir wouldn't help a release-profile build.
       - name: Install UI dependencies (tauri beforeBuildCommand needs vite)
-        working-directory: daisy-chain/ui
+        working-directory: ./ui
         run: npm ci
 
       # Provision the signing identity in a temporary login keychain. The
@@ -165,12 +165,12 @@ jobs:
       # spctl/stapler gates. Replaces stages 4/5 install+verify with nothing —
       # on the runner the .app under target/release/bundle is the artifact.
       - name: Build, sign, notarize, staple
-        working-directory: daisy-chain
+        working-directory: .
         run: ./make-installer.sh
 
       - name: Locate the stapled DMG
         id: dmg
-        working-directory: daisy-chain
+        working-directory: .
         run: |
           DMG=$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -1)
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
@@ -188,6 +188,6 @@ jobs:
         with:
           name: daisy-release-logs
           path: |
-            daisy-chain/logs/
+            logs/
             /tmp/daisy-*.zip
           if-no-files-found: ignore
