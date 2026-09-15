@@ -33,7 +33,12 @@ ENVFILE="$ROOT/.env"
 TELEMETRY_PORT="${DAISY_TELEMETRY_PORT:-6292}"
 UI_PORT="${DAISY_UI_PORT:-5183}"
 SHELL_BIN="$ROOT/src-tauri/target/debug/daisy-cluster"
-NODE_BIN="/usr/local/bin/node"
+# Node resolution: explicit override first (CI hands the setup-node binary),
+# then PATH, then the two Homebrew prefixes. /usr/local/bin alone breaks on
+# Apple Silicon machines and on GitHub's macOS runners.
+NODE_BIN="${DAISY_NODE_BIN:-$(command -v node || true)}"
+[ -n "$NODE_BIN" ] || NODE_BIN="/opt/homebrew/bin/node"
+[ -x "$NODE_BIN" ] || NODE_BIN="/usr/local/bin/node"
 
 mkdir -p "$PIDDIR" "$LOGDIR"
 [ -f "$ENVFILE" ] && set -a && . "$ENVFILE" && set +a   # load key into env (silently)
