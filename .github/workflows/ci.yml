@@ -55,7 +55,12 @@ jobs:
 
       - name: Start the stack (headless orchestrator + telemetry)
         working-directory: .
-        run: ./clusterctl.sh start --no-ui
+        # setup-node's shims aren't visible inside the spawner's env, and
+        # clusterctl hardcodes /usr/local/bin/node — hand it the real binary.
+        run: |
+          NODE_BIN="$(command -v node)"
+          echo "NODE_BIN=$NODE_BIN" >> "$GITHUB_ENV"
+          DAISY_NODE_BIN="$NODE_BIN" ./clusterctl.sh start --no-ui
 
       - name: Run the full fast battery (8 suites, 76 checks)
         working-directory: .
