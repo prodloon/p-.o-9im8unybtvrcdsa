@@ -24,6 +24,40 @@ const crypto = require('crypto');
 
 const ACTIONS = ['list_files', 'read_file', 'write_file', 'append_file', 'delete_file', 'mkdir', 'file_stats', 'scaffold', 'http_get_json', 'SNIPE'];
 
+// --- regex pattern safety (list_files) --------------------------------------
+// Workers run IN-PROCESS with the orchestrator, so a regex that backtracks
+// catastrophically on one filename would hang the whole event loop, not just
+// one task. Node has no regex timeout, so we gate patterns at compile time:
+//
+//   1. length cap — no legitimate filename filter needs more than this;
+//   2. reject the classic catastrophic shapes: a quantified group whose body
+//      itself contains a quantifier or an alternation, e.g. (a+)+$, (x+x+)+y,
+//      (a|aa)*$. These blow up exponentially on near-match input.
+//
+// Conservative by design: if a future pattern legitimately needs a quantified
+// alternation, it should be added here as an explicit, reviewed allowlist
+// entry — not by loosening the shape check.
+const MAX_PATTERN_LENGTH = 256;
+const QUANTIFIED_GROUP = /\(([^()]*)\)\s*([+*]|\{\d+(?:,\d*)?\})/g;
+
+function assertPatternSafe(pattern) {
+  const p = String(pattern);
+  if (p.length > MAX_PATTERN_LENGTH) {
+    throw new Error(`list_files: pattern too long (${p.length} chars, max ${MAX_PATTERN_LENGTH})`);
+  }
+  let m;
+  QUANTIFIED_GROUP.lastIndex = 0;
+  while ((m = QUANTIFIED_GROUP.exec(p)) !== null) {
+    const [, body] = m;
+    if (/[+*{]/.test(body) || body.includes('|')) {
+      throw new Error(
+        `list_files: pattern rejected — quantified group '( ${'…'} )${m[2]}' has a quantifier or alternation inside, which can backtrack catastrophically`
+      );
+    }
+  }
+  return p;
+}
+
 class Worker {
   /**
    * @param {object} opts
@@ -80,7 +114,7 @@ class Worker {
     const base = this._safePath(dir);
     let names = fs.readdirSync(base);
     if (pattern) {
-      const rx = new RegExp(pattern);
+      const rx = new RegExp(assertPatternSafe(pattern));
       names = names.filter((n) => rx.test(n));
     }
     return { files: names.sort() };
@@ -252,4 +286,4 @@ class Worker {
   }
 }
 
-module.exports = { Worker, ACTIONS };
+module.exports = { Worker, ACTIONS, assertPatternSafe, MAX_PATTERN_LENGTH };

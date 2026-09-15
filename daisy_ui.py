@@ -1070,6 +1070,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 const $=q=>document.querySelector(q);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// escJs: safe to interpolate into a single-quoted JS string literal that
+// itself sits inside an HTML attribute (e.g. onclick="fn('${escJs(x)}')").
+// NOTE: HTML-entity-escaping alone (esc()) is NOT enough here — the browser
+// decodes HTML entities in the attribute value BEFORE compiling it as the
+// handler's JS source, so an apostrophe encoded as &#39; still comes back
+// as a literal ' by the time it's parsed as JS and breaks out of the
+// string. Must backslash-escape for the JS-string context first, then
+// HTML-escape the result for the attribute context.
+const escJs=s=>esc(String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"));
 let polling=null;
 
 function toast(msg,err){const t=$('#toast');t.textContent=msg;t.className='toast show'+(err?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='toast',3200);}
@@ -1207,8 +1216,8 @@ async function loadProvisioner(){
   $('#pendingList').innerHTML=p.items.map(i=>{const c=i.candidate||{};return `
     <div class="pending-item"><div style="flex:1">
       <b>${esc(c.kind||'?')}</b> · ${esc(c.name||'?')} <span class="why">— ${esc(c.reason||'')}</span></div>
-      <button class="mini" onclick="decide('${esc(c.name)}','approve')">Approve</button>
-      <button class="mini ghost" onclick="decide('${esc(c.name)}','dismiss')">Dismiss</button>
+      <button class="mini" onclick="decide('${escJs(c.name)}','approve')">Approve</button>
+      <button class="mini ghost" onclick="decide('${escJs(c.name)}','dismiss')">Dismiss</button>
     </div>`}).join('')||'<div class="empty">Nothing parked — the provisioner proposes things on its cycles.</div>';
   $('#provLog').textContent=log.entries.map(e=>{
     const t=(e.timestamp||'').slice(11,19);const d=typeof e.detail==='object'?JSON.stringify(e.detail):e.detail;
@@ -1269,7 +1278,7 @@ async function loadResearch(){
   gapCache={};
   $('#gapList').innerHTML=gaps.length?gaps.map(([f,who])=>{
     gapCache[f]=who;
-    return `<div class="gaprow"><div class="gapname">${esc(f)}</div><div class="gapwho">in ${esc(who.join(', '))}</div><button class="ghost" onclick="researchTask('${esc(f).replace(/'/g,"\\'")}')">Explore</button></div>`;
+    return `<div class="gaprow"><div class="gapname">${esc(f)}</div><div class="gapwho">in ${esc(who.join(', '))}</div><button class="ghost" onclick="researchTask('${escJs(f)}')">Explore</button></div>`;
   }).join(''):'<div class="empty">No gaps detected in the latest cycle 🎉</div>';
   const nGaps=gaps.length;
   const badge=$('#researchBadge');
@@ -1280,7 +1289,7 @@ async function loadResearch(){
     if(f.status==='fetch_failed')return `<div class="comprow"><b>${esc(f.repo)}</b> <span class="tag bad">fetch failed</span><div class="dimtxt">${esc(f.error||'')}</div></div>`;
     const feats=(f.features_signalled||[]).map(x=>`<span class="tag">${esc(x)}</span>`).join('');
     const isNew=f.status==='new_release'?` <span class="tag ok">NEW</span>`:'';
-    const link=f.url?` <a class="relink" href="#" onclick="openRelease('${esc(f.url)}');return false">release ↗</a>`:'';
+    const link=f.url?` <a class="relink" href="#" onclick="openRelease('${escJs(f.url)}');return false">release ↗</a>`:'';
     return `<div class="comprow"><b>${esc(f.name||f.repo)}</b> <span style="color:var(--dim)">${esc(f.latest||'?')}</span>${isNew}${link}<div class="dimtxt">${esc(f.blurb||'')}</div><div style="margin-top:4px">${feats||'<span class="dimtxt">no feature signals</span>'}</div></div>`;
   }).join(''):'<div class="empty">no data</div>';
   // self-update status
@@ -1368,7 +1377,7 @@ async function loadSystem(){
   const[m,d]=await Promise.all([get('/api/models'),get('/api/du')]);
   $('#modelList').innerHTML=(m.models||[]).map(x=>`<div class="kv">
       <div><b>${esc(x.name)}</b>${x.size_gb?`<div style="color:var(--dim);font-size:12px">${x.size_gb} GB</div>`:''}</div>
-      <button class="mini ghost" title="Delete model and free disk" onclick="delModel('${esc(x.name)}','${x.size_gb||''}')">✕</button>
+      <button class="mini ghost" title="Delete model and free disk" onclick="delModel('${escJs(x.name)}','${escJs(x.size_gb||'')}')">✕</button>
     </div>`).join('')||'<span class="empty">none</span>';
   $('#duText').textContent=d.text||d.error||'unavailable';
 }

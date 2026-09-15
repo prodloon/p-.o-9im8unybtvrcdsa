@@ -19,6 +19,30 @@
 #   ./make-installer.sh --skip     # skip cargo build; restage + reinstall only
 #   NO_APP_VERIFY=1 ./make-installer.sh   # skip stage 5 (headless/CI)
 #   DAISY_VERIFY_ONLY='<bundle>' ./make-installer.sh   # run stage 5 against an existing bundle, nothing rebuilt
+#
+# Distribution (Stage 6 — optional, opt-in):
+#   Ad-hoc signing (-s -) satisfies Gatekeeper only on THIS Mac. An app given
+#   to anyone else is blocked on first launch. Stage 6 signs with a real
+#   Developer ID certificate, notarizes via Apple's notary service, and
+#   staples the ticket — the full Gatekeeper-clean pipeline:
+#
+#   Prerequisites (one-time):
+#     • Apple Developer Program membership ($99/yr) — free accounts cannot
+#       create the required certificate.
+#     • "Developer ID Application" certificate in the login keychain
+#       (check: security find-identity -p basic -v).
+#     • Credentials stored once: xcrun notarytool store-credentials \
+#         --apple-id you@example.com --team-id TEAMID   (uses an
+#       app-specific password; profile name is what you pass below).
+#
+#   DAISY_SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
+#   DAISY_NOTARY_PROFILE='daisy-notary' \
+#   ./make-installer.sh --skip
+#
+#   With DAISY_SIGN_IDENTITY set, stage 3 signs with Hardened Runtime
+#   (a notarization requirement) instead of ad-hoc, and stage 6 submits the
+#   zip to notarytool, staples the ticket onto the .app, and verifies with
+#   spctl. Without it, behavior is unchanged (ad-hoc, local Mac only).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +50,53 @@ SRC="$ROOT/src-tauri/target/release"
 APP_NAME="Daisy Cluster.app"
 BUNDLED="$SRC/bundle/macos/$APP_NAME"
 INSTALLED="/Applications/$APP_NAME"
-NODE_BIN=/usr/local/bin/node
+# Portable node resolution — see clusterctl.sh for why /usr/local/bin alone
+# is wrong on Apple Silicon Homebrew installs.
+NODE_BIN="$(command -v node 2>/dev/null || true)"
+if [ -z "$NODE_BIN" ]; then
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
+    [ -x "$candidate" ] && NODE_BIN="$candidate" && break
+  done
+fi
+if [ -z "$NODE_BIN" ]; then
+  echo "make-installer: node not found (checked PATH, /opt/homebrew/bin, /usr/local/bin)." >&2
+  exit 1
+fi
+
+# Distribution signing (empty = ad-hoc, this Mac only — see header).
+SIGN_IDENTITY="${DAISY_SIGN_IDENTITY:-}"
+NOTARY_PROFILE="${DAISY_NOTARY_PROFILE:-}"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Bundle-drift guard: exactly ONE Daisy .app may exist in /Applications.
+# The Round-4 audit found three competing bundles — one of them an unsigned
+# stripped duplicate, one a legacy launcher whose "binary" was a bash script
+# pointing outside the bundle. A customer (or a future you) launching the
+# wrong one gets the broken build, and diagnose time burns on "which app did
+# you open?". Fail the build early instead. Skippable for exotic setups:
+#   DAISY_ALLOW_EXTRA_BUNDLES=1 ./make-installer.sh
+# ────────────────────────────────────────────────────────────────────────────
+if [ -z "$VERIFY_ONLY" ] && [ "${DAISY_ALLOW_EXTRA_BUNDLES:-0}" != "1" ]; then
+  APPS_DIR="${DAISY_APPS_DIR:-/Applications}"
+  extras=""
+  for candidate in "$APPS_DIR/"*[Dd]aisy*.app "$APPS_DIR/"*[Dd]AISY*.app; do
+    [ -d "$candidate" ] || continue
+    case "$(basename "$candidate")" in
+      "$APP_NAME") ;;                                    # canonical — fine
+      *) extras="${extras:+$extras\n}  $candidate" ;;
+    esac
+  done
+  if [ -n "$extras" ]; then
+    echo "make-installer: competing Daisy .app bundle(s) found in $APPS_DIR:" >&2
+    printf '%b\n' "$extras" >&2
+    echo "  → a second bundle means someone can launch the wrong build." >&2
+    echo "  → remove the extras (archive first if wanted):" >&2
+    echo "      ditto -c -k --keepParent '<bundle>' ~/Desktop/'<bundle>.zip' && rm -rf '<bundle>'" >&2
+    echo "  → or, if the extras are intentional, re-run with DAISY_ALLOW_EXTRA_BUNDLES=1" >&2
+    exit 1
+  fi
+  echo "✔ bundle-drift guard: only the canonical bundle exists in $APPS_DIR"
+fi
 
 cd "$ROOT/src-tauri"
 
@@ -35,7 +105,7 @@ if [ -z "$VERIFY_ONLY" ]; then
 
 if [ "${1:-}" != "--skip" ]; then
   echo "▶ 1/5 tauri build (release; takes minutes)…"
-  "$ROOT/ui/node_modules/.bin/tauri" build 2>&1 | tail -4
+  npx --prefix "$ROOT/ui" tauri build 2>&1 | tail -4
 else
   echo "▶ 1/5 skipped (--skip)"
 fi
@@ -50,9 +120,29 @@ rsync -a \
   --exclude '.env' --exclude '.DS_Store' \
   ./ "$BUNDLED/Contents/Resources/appdata/"
 
-echo "▶ 3/5 swapping in the freshly built binary + ad-hoc sign…"
+echo "▶ 3/5 swapping in the freshly built binary + $([ -n "$SIGN_IDENTITY" ] && echo 'Developer ID' || echo 'ad-hoc') sign…"
 cp "$SRC/daisy-cluster" "$BUNDLED/Contents/MacOS/daisy-cluster"
-codesign --force -s - "$BUNDLED" 2>/dev/null || true
+if [ -n "$SIGN_IDENTITY" ]; then
+  # Hardened Runtime is REQUIRED for notarization. WebKit's JIT needs the
+  # allow-jit entitlement under Hardened Runtime; the backend spawns node
+  # (external binary) so no allow-unsigned-executable-memory is needed here.
+  ENTITLEMENTS="$(mktemp /tmp/daisy-entitlements.XXXXXX.plist)"
+  cat > "$ENTITLEMENTS" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.cs.allow-jit</key><true/>
+  </dict>
+</plist>
+EOF
+  codesign --force --options runtime --entitlements "$ENTITLEMENTS" \
+    --sign "$SIGN_IDENTITY" "$BUNDLED"
+  rm -f "$ENTITLEMENTS"
+  codesign --verify --strict "$BUNDLED"   # fail the build on a bad signature
+else
+  codesign --force -s - "$BUNDLED" 2>/dev/null || true
+fi
 
 echo "▶ 4/5 installing to ${INSTALLED}…" # brace the var: bash parses $INSTALLED… (ellipsis) as one name under set -u
 [ -d "$INSTALLED" ] && rm -rf "$INSTALLED"
@@ -175,3 +265,41 @@ echo "✔ installed: $INSTALLED ($(du -sh "$INSTALLED" | cut -f1))"
 echo "  runtime data: ~/Library/Application Support/DaisyCluster/"
 echo "  secrets:      put OPENROUTER_API_KEY in ~/Library/Application Support/DaisyCluster/.env"
 echo "  launch:       open '/Applications/Daisy Cluster.app'"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stage 6 (optional): notarize + staple for distribution outside this Mac.
+# Runs only when DAISY_SIGN_IDENTITY is set (see header for prerequisites).
+# Notary accepts app/zip/dmg/pkg; we submit a ditto-created zip (preserves
+# the signature, unlike tar). --wait polls until Apple returns a verdict.
+# ────────────────────────────────────────────────────────────────────────────
+if [ -n "$SIGN_IDENTITY" ]; then
+  if [ -z "$NOTARY_PROFILE" ]; then
+    echo "✗ DAISY_SIGN_IDENTITY set but DAISY_NOTARY_PROFILE missing —" \
+        "store credentials once with: xcrun notarytool store-credentials" >&2
+    exit 1
+  fi
+  echo "▶ 6/6 notarizing + stapling (Apple notary service; usually 1–5 min)…"
+  ZIP="$(mktemp /tmp/daisy-notarize.XXXXXX.zip)"
+  # ditto keeps the code signature intact (zip -r can corrupt it).
+  ditto -c -k --keepParent "$INSTALLED" "$ZIP"
+  xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+  rm -f "$ZIP"
+  xcrun stapler staple "$INSTALLED"
+  spctl --assess --type execute -vv "$INSTALLED"
+  echo "✔ notarized + stapled — Gatekeeper-clean for distribution"
+
+  # The .dmg from stage 1 is a separate artifact with its own Gatekeeper
+  # story: notarize it too (notary accepts dmg natively — no zip wrapper
+  # needed) and staple the ticket onto the image, so the DMG itself shows
+  # "verified by Apple" on the recipient's Mac, not just the app inside it.
+  DMG="$(ls -t "$SRC"/bundle/dmg/*.dmg 2>/dev/null | head -1)"
+  if [ -n "$DMG" ]; then
+    echo "  → notarizing DMG: $(basename "$DMG")"
+    xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG"
+    xcrun stapler validate "$DMG"
+    echo "  ✔ DMG notarized + stapled — distributable disk image is Gatekeeper-clean"
+  else
+    echo "  ⚠ no .dmg found in $SRC/bundle/dmg/ — skipped DMG notarization"
+  fi
+fi

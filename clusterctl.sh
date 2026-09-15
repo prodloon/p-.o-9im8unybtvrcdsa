@@ -39,6 +39,11 @@ SHELL_BIN="$ROOT/src-tauri/target/debug/daisy-cluster"
 NODE_BIN="${DAISY_NODE_BIN:-$(command -v node || true)}"
 [ -n "$NODE_BIN" ] || NODE_BIN="/opt/homebrew/bin/node"
 [ -x "$NODE_BIN" ] || NODE_BIN="/usr/local/bin/node"
+if [ ! -x "$NODE_BIN" ]; then
+  echo "clusterctl: node not found (checked \$DAISY_NODE_BIN, PATH, /opt/homebrew/bin, /usr/local/bin)." >&2
+  echo "Install Node.js (https://nodejs.org) or make sure it's on your PATH, then retry." >&2
+  exit 1
+fi
 
 mkdir -p "$PIDDIR" "$LOGDIR"
 [ -f "$ENVFILE" ] && set -a && . "$ENVFILE" && set +a   # load key into env (silently)

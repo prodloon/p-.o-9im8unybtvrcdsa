@@ -236,9 +236,13 @@ suite('S6: hibernate → wake round-trip preserves state');
 // ============================================================================
 suite('S8: real system RAM reader sanity');
 {
+  const os = require('os');
   const { systemRamReader } = require('./governor');
   const r = systemRamReader();
-  check('totalBytes matches the OS-reported RAM', Math.abs(r.totalBytes - os.totalmem()) < 512 * 1024 ** 2, `${(r.totalBytes / 1024 ** 3).toFixed(2)} GiB (os.totalmem ${(os.totalmem() / 1024 ** 3).toFixed(2)} GiB)`);
+  // Portable: compare against Node's own os.totalmem() rather than a
+  // hardcoded figure — this selftest must pass on ANY customer's Mac, not
+  // just the 16 GiB machine it was originally written on.
+  check('totalBytes matches the host (os.totalmem)', Math.abs(r.totalBytes - os.totalmem()) < 512 * 1024 ** 2, `${(r.totalBytes / 1024 ** 3).toFixed(2)} GiB vs os.totalmem ${(os.totalmem() / 1024 ** 3).toFixed(2)} GiB`);
   check('usedBytes is a sane positive number', r.usedBytes > 0 && r.usedBytes < r.totalBytes, `${(r.usedBytes / 1024 ** 3).toFixed(2)} GiB used`);
   const pct = (r.usedBytes / r.totalBytes) * 100;
   check('computed pct in range', pct > 0 && pct < 100, `${pct.toFixed(1)}%`);

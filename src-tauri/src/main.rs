@@ -112,8 +112,9 @@ fn spawn_backend() -> Option<Child> {
         }
     }
 
-    // Prefer the exact node the user has; fall back to PATH lookup.
-    for candidate in ["/usr/local/bin/node", "node"] {
+    // Apple Silicon Homebrew lives in /opt/homebrew — explicit fallback keeps
+    // Rust and the shell scripts (portability pass) in agreement.
+    for candidate in ["/usr/local/bin/node", "/opt/homebrew/bin/node", "node"] {
         let mut cmd = Command::new(candidate);
         cmd.arg(&script)
             .arg("--serve")
@@ -136,6 +137,27 @@ fn spawn_backend() -> Option<Child> {
     }
     eprintln!("[shell] could not spawn node — is Node on PATH?");
     None
+}
+
+/// First-run dependency check: without Node the backend can never spawn and
+/// the app would sit silent on a dead dashboard. Best-effort native dialog
+/// (never blocks or crashes the shell); the UI additionally renders a banner
+/// fed by the `shell://no-node` event emitted from setup.
+fn alert_no_node() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let script = format!(
+        "display dialog \"{}\" with title \"Daisy Cluster\" buttons {{\"Quit\"}} default button \"Quit\" with icon stop",
+        // Backslash FIRST, then quote — reversing the order corrupts the text.
+        "Daisy Cluster could not find Node.js.\n\nInstall Node and relaunch (e.g. `brew install node`, or from https://nodejs.org). The orchestrator cannot start without it."
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn();
 }
 
 fn read_telemetry(root: &PathBuf) -> Option<serde_json::Value> {
@@ -172,12 +194,26 @@ fn main() {
                 let _ = w.set_focus();
             }
         }))
+        // Auto-update: check the release feed on launch (silent when
+        // up-to-date). Gated to signed release builds — dev/ad-hoc builds have
+        // no pubkey and would fail the signature check on every start.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(BackendHandle(Mutex::new(None)))
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // 1. Spawn the orchestrator.
+            // 1. Spawn the orchestrator. If Node is missing entirely, say so
+            // loudly (dialog + in-app banner) instead of failing silently.
             let child = spawn_backend();
+            if child.is_none() {
+                use tauri::Emitter;
+                alert_no_node();
+                let _ = handle.emit(
+                    "shell://no-node",
+                    "Node.js not found — the orchestrator cannot start. Install Node (brew install node, or nodejs.org) and relaunch.",
+                );
+            }
             *app.state::<BackendHandle>().0.lock().unwrap() = child;
 
             // 2. Telemetry emit loop (native IPC, 1 Hz) + outage watcher.

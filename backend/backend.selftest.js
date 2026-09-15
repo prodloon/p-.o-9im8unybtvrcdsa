@@ -5,8 +5,18 @@
  * ============================================
  * Deterministic: cloud is a mocked fetchImpl, RAM is synthetic, clock is fake.
  * Run: node backend/backend.selftest.js
+ *      node backend/backend.selftest.js --fast
+ *
+ * --fast: same 141 checks, but the suites that build a default keyless
+ * bridge disable its Tier-2 (local Ollama) leg. Today the default leg points
+ * at REAL localhost Ollama when it's running, so an unmatched task summary
+ * triggers a genuine qwen2.5:7b inference — minutes per consult on cold
+ * hardware. --fast keeps the full T2 LOGIC coverage (S6/S21 mock every T2
+ * shape) while making CI deterministic in wall time. Full-mode (no flag)
+ * behavior is unchanged.
  */
 
+const FAST = process.argv.includes('--fast');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -17,6 +27,7 @@ const { SupervisorBridge, POLICY } = require('./supervisor-bridge');
 const { SkillInjector } = require('./skill-injector');
 const { Orchestrator } = require('./index');
 const { KeyHealthMonitor, classifyKeyResponse, fingerprintKey, CLASSIFICATION } = require('./key-health');
+const { assertPatternSafe, MAX_PATTERN_LENGTH } = require('./worker');
 
 let pass = 0;
 let fail = 0;
@@ -32,6 +43,20 @@ function check(name, cond, detail = '') {
   }
 }
 const suite = (name) => console.log(`\n— ${name} ${'—'.repeat(Math.max(1, 60 - name.length))}`);
+
+/**
+ * Keyless bridge for orchestrator suites that only exercise Tier-1 or the
+ * offline fallback. In --fast mode the Tier-2 (Ollama) leg is disabled so
+ * no suite ever makes a real local-LLM call; full mode keeps the production
+ * default (real Ollama triage when it's running).
+ */
+function makeKeylessBridge(label) {
+  if (FAST) {
+    console.log(`  [fast] ${label}: tier2 (local Ollama) leg disabled — no real LLM calls`);
+    return new SupervisorBridge({ apiKey: null, tier2: null });
+  }
+  return new SupervisorBridge({ apiKey: null });
+}
 
 /** Throwaway workspace: temp sandbox + temp sqlite + fake clock + synthetic RAM. */
 function makeEnv({ usedGB = 8, totalGB = 16 } = {}) {
@@ -88,6 +113,24 @@ async function main() {
 
       const r5 = await w.step({ id: 5, kind: 'file-io', payload: { action: 'no_such_action' } });
       check('unknown action rejected', r5.ok === false && /unknown action/.test(r5.error));
+
+      // ReDoS hardening: catastrophic patterns must be refused at compile time
+      // (before they can hang the in-process event loop), and benign patterns
+      // must still work.
+      fs.writeFileSync(path.join(env.tmp, 'aaa.txt'), 'x');
+      const rOk = await w.step({ id: 6, kind: 'file-io', payload: { action: 'list_files', params: { pattern: '^a+\\.txt$' } } });
+      check('benign regex pattern still filters', rOk.ok && rOk.result.files.includes('aaa.txt'));
+
+      const rEvil1 = await w.step({ id: 7, kind: 'file-io', payload: { action: 'list_files', params: { pattern: '(a+)+$' } } });
+      check('catastrophic (a+)+ pattern refused', rEvil1.ok === false && /catastrophic|quantifier or alternation/.test(rEvil1.error));
+
+      const rEvil2 = await w.step({ id: 8, kind: 'file-io', payload: { action: 'list_files', params: { pattern: '(a|aa)*$' } } });
+      check('catastrophic alternation-in-quantified-group refused', rEvil2.ok === false && /catastrophic|quantifier or alternation/.test(rEvil2.error));
+
+      const rLong = await w.step({ id: 9, kind: 'file-io', payload: { action: 'list_files', params: { pattern: 'a'.repeat(MAX_PATTERN_LENGTH + 1) } } });
+      check('over-length pattern refused', rLong.ok === false && /too long/.test(rLong.error));
+
+      check('assertPatternSafe accepts ordinary patterns', (() => { assertPatternSafe('^w[0-9]{2}$'); return true; })());
 
       check('worker heartbeats governor', env.governor.heartbeat('w-t1') === true);
     } finally {
@@ -364,9 +407,8 @@ async function main() {
   {
     const env = makeEnv();
     try {
-      const bridge = new SupervisorBridge({ apiKey: null });
+      const bridge = makeKeylessBridge('S10');
       const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
-
       env.governor.enqueueTask('file-io', { action: 'write_file', params: { path: 'out.txt', content: 'x' } });
       env.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'bulk rename files in dir' });
       const t3 = env.governor.enqueueTask('file-io', { action: 'explode', params: {} }); // poison: unknown action
@@ -458,7 +500,7 @@ async function main() {
     {
       const env = makeEnv();
       try {
-        const bridge = new SupervisorBridge({ apiKey: null });
+        const bridge = makeKeylessBridge('S12c');
         const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
         env.governor.enqueueTask('file-io', { action: 'write_file', params: { path: 'x.txt', content: 'y' } });
         await orch.runCycle();
@@ -480,7 +522,7 @@ async function main() {
   {
     const env = makeEnv();
     try {
-      const bridge = new SupervisorBridge({ apiKey: null }); // keyless: escalate → decline
+      const bridge = makeKeylessBridge('S14'); // keyless: escalate → decline
       const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
 
       // Task A: matched scaffold → tier-1 injects into w-0001-scaffold.
@@ -524,7 +566,7 @@ async function main() {
 
     const env = makeEnv();
     try {
-      const bridge = new SupervisorBridge({ apiKey: null });
+      const bridge = makeKeylessBridge('S15');
       const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
       check('bridge tier3ConsultCostUsd() agrees with POLICY math', Math.abs(bridge.tier3ConsultCostUsd() - unit) < 1e-9);
 
@@ -695,11 +737,8 @@ async function main() {
   // ============================================================================
   suite('S20: key-health — classifier, masked telemetry, probe loop');
   {
-    // FIXTURE KEY IS SYNTHETIC (S23-enforced): the 2026-09-12 leak — the real
-    // key hardcoded here, committed, and tagged — is why scripts/scan-secrets.js
-    // gates every push. Built from fragments so no full-shape key literal
-    // exists in source: the scanner cannot tell synthetic from real, and it
-    // must never have to. Never put a live key in this file.
+    // Synthetic key assembled from fragments — a literal full-shape key here
+    // would trip the S23 self-scan (and has: that's why S23 exists).
     const ROTATION_KEY = ['sk-or-v1-', '0f3e5d7c9a1b2c8d', '4e6f0a9b8c7d6e5f', '4a3b2c1d0e9f8a7b'].join('');
     const ROTATION_FP = fingerprintKey(ROTATION_KEY);
 
@@ -721,8 +760,7 @@ async function main() {
 
     // 20b. fingerprint — masked, short, safe for logs and telemetry
     {
-      check('fingerprint masks the middle', ROTATION_FP.startsWith(ROTATION_KEY.slice(0, 12)) && ROTATION_FP.endsWith(ROTATION_KEY.slice(-4)) && ROTATION_FP.includes('…'));
-      check('fingerprint shape = head12 + … + tail4 (pinned on synthetic key)', ROTATION_FP === `${ROTATION_KEY.slice(0, 12)}…${ROTATION_KEY.slice(-4)}`);
+      check('fingerprint masks the middle', ROTATION_FP.startsWith(ROTATION_KEY.slice(0, 12)) && ROTATION_FP.endsWith(ROTATION_KEY.slice(-4)) && ROTATION_FP.includes('…') && !ROTATION_FP.includes(ROTATION_KEY.slice(12, -4)));
       check('fingerprint carries ≤ 16 key chars', ROTATION_FP.replace('…', '').length <= 16);
       check('short key → ??', fingerprintKey('abc') === '??');
       check('non-string → ??', fingerprintKey(null) === '??');
@@ -777,7 +815,7 @@ async function main() {
         let probes = 0;
         const kh = new KeyHealthMonitor({ apiKey: ROTATION_KEY, clock: () => 12345, fetchImpl: async () => { probes += 1; return { status: 200, json: async () => ({ data: { label: 'daisy-cluster', usage: 0.5, limit: 10 } }) }; } });
         await kh.probe();
-        const bridge = new SupervisorBridge({ apiKey: null });
+        const bridge = makeKeylessBridge('S20d');
         const orch = new Orchestrator({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox'), keyHealth: kh });
         const tel = orch.telemetry();
         check('telemetry exposes keyHealth verdict', !!tel.keyHealth && tel.keyHealth.status === 'ok' && tel.keyHealth.label === 'daisy-cluster');
@@ -848,7 +886,6 @@ async function main() {
     }
   }
 
-  // ============================================================================
   suite('S22: t2-canary — residency classifier, edge-triggered alerts, wiring');
   {
     const { T2Canary, classifyPsResponse, CLASSIFICATION: T2_CLASS, BAD_STATES } = require('./t2-canary');
@@ -1018,6 +1055,7 @@ async function main() {
       check('backend.selftest.js source is scan-clean (fixture built from fragments)', findSecrets(own).length === 0, 'a full-shape key literal re-entered this file');
     }
   }
+
 
   // ============================================================================
   suite('S11: governor regression — Phase 1 battery still green');

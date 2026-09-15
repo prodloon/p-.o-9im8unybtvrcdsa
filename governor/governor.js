@@ -67,8 +67,13 @@ function readProcessStats(pid) {
       const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
       const m = status.match(/^VmRSS:\s+(\d+) kB/m);
       const rssBytes = m ? Number(m[1]) * 1024 : null;
-      return { cpuPct: null, rssBytes, _ticks, _hz: hz };
-  }
+      // BUG FIX: this used to reference an undefined `_ticks`, which threw
+      // and was silently swallowed by the catch below — readProcessStats
+      // always returned nulls on Linux even though rssBytes was readable.
+      // cpuPct still correctly stays null here (needs two samples to derive
+      // a rate from cumulative ticks; that's the caller's job, not this fn's).
+      return { cpuPct: null, rssBytes, _ticks: ticks, _hz: hz };
+    }
   } catch {
     /* process gone or ps unavailable — telemetry is best-effort */
   }
