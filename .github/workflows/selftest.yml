@@ -26,10 +26,17 @@ on:
 # The second job builds the real installer with NO_APP_VERIFY=1 (stage 5
 # launches the installed app — no GUI on runners) so payload regressions —
 # missing staged modules, broken wiring, a binary without the shell's proof
-# line — fail CI, not the next local build. It mirrors the selftest job's
-# toolchain steps; runs in PARALLEL (no needs) so the two signals stay
-# independent — a payload break shouldn't be masked by, or wait behind, an
-# unrelated battery failure.
+# line — fail the build, not the next local build. It mirrors the selftest
+# job's toolchain steps.
+#
+# COST GATE: a full macOS tauri build burns ~5 billable minutes per run, so
+# the installer job runs ONLY on version tags and manual dispatch. The cheap
+# battery job (~1 min) gates every push/PR; the expensive build runs at the
+# moments that produce artifacts people actually consume. A PR that would
+# break the installer payload still can't break a release silently: the tag
+# push runs the installer before any release artifacts exist, and
+# workflow_dispatch lets you build-install on any branch before merging
+# when the change touches packaging.
 
 jobs:
   selftest:
@@ -133,6 +140,12 @@ jobs:
   installer:
     runs-on: macos-14
     timeout-minutes: 45
+    # Cost gate: only version tags and manual runs (rationale above).
+    # Deliberately NOT `needs: selftest` — the two jobs exercise different
+    # things, and a tag shouldn't wait behind the battery to produce build
+    # artifacts. The battery gates pushes; the release workflow gates tags
+    # end-to-end.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
 
     steps:
       - uses: actions/checkout@v4
