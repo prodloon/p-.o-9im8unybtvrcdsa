@@ -18,9 +18,20 @@ A local-first multi-agent orchestrator with a desktop telemetry window:
   kills it cleanly on quit. The app owns its orchestrator; you never run
   anything by hand.
 
-The app is signed with a **Developer ID certificate and notarized by
-Apple** (the disk image is stapled too), so Gatekeeper treats it as
-verified software from the first launch.
+The app is ad-hoc signed in release candidates (rc1–rc3) — its seal is
+integrity-checked at build time, but it carries **no Apple Developer ID
+certificate**. Until proper signing lands, Gatekeeper will refuse the
+first launch:
+
+- macOS may report the app as **"damaged"** — that is the un-notarized
+  ad-hoc signature, not actual corruption. Verify the download against
+  the release's `SHA256SUMS.txt` first, then approve it once via
+  **System Settings → Privacy & Security → Security → Open Anyway**
+  (or `xattr -dr com.apple.quarantine` on the app before first launch).
+- Once Developer ID signing + notarization is in place (Apple Developer
+  Program enrollment is the outstanding prerequisite), this section
+  reverts to: Gatekeeper treats the app as verified software from the
+  first launch, no override needed.
 
 ---
 
@@ -69,11 +80,12 @@ a key, and the dashboard's `key` chip will read `missing` to say so.
 2. Open it and drag **Daisy Cluster** to `/Applications`.
 3. Launch it once from Applications.
 
-Because the app and disk image are notarized **and** stapled, the first
-launch is clean: no "unidentified developer" warning, no right-click
-override. If you ever see a Gatekeeper warning anyway ("damaged" or
-"cannot be opened"), the copy you have was not downloaded through a
-release page — re-download rather than overriding.
+In the current release candidates, the first launch shows a Gatekeeper
+prompt or a "damaged" warning — see the signing note above for the
+one-time approval. This is expected while the app is ad-hoc signed and
+not notarized. Once Developer ID notarization lands, the first launch
+becomes clean: no "unidentified developer" warning, no right-click
+override.
 
 On first launch the app: creates its data directory, spawns the Node
 orchestrator, and opens the telemetry dashboard. Quitting the window
