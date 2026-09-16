@@ -196,8 +196,8 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
-      - name: Build installer (stages 1–4, stage 5 skipped headless)
-        run: NO_APP_VERIFY=1 ./make-installer.sh
+      - name: Build installer (universal; stages 1–4, stage 5 skipped headless)
+        run: NO_APP_VERIFY=1 TAURI_UNIVERSAL=1 ./make-installer.sh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}

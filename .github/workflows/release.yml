@@ -99,8 +99,20 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
-      - name: Build installer (stages 1–4, stage 5 skipped headless)
-        run: NO_APP_VERIFY=1 ./make-installer.sh
+      - name: Build installer (universal; stages 1–4, stage 5 skipped headless)
+        run: NO_APP_VERIFY=1 TAURI_UNIVERSAL=1 ./make-installer.sh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Locate bundle directory (universal vs native)
+        run: |
+          set -euo pipefail
+          B=src-tauri/target/release/bundle
+          [ -d "$B" ] || B=src-tauri/target/universal-apple-darwin/release/bundle
+          ls "$B/macos" "$B/dmg" 2>/dev/null || { echo "no bundle found under $B" >&2; exit 1; }
+          echo "BUNDLE=$B" >> "$GITHUB_ENV"
+
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -120,8 +132,8 @@ jobs:
             key: Buffer.concat([Buffer.from('302a300506032b6570032100','hex'), pubBody.slice(10)]),
             format: 'der', type: 'spki',
           });
-          const tar = fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz');
-          const sigFileText = fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz.sig', 'utf8');
+          const tar = fs.readFileSync(process.env.BUNDLE + '/macos/Daisy Cluster.app.tar.gz');
+          const sigFileText = fs.readFileSync(process.env.BUNDLE + '/macos/Daisy Cluster.app.tar.gz.sig', 'utf8');
           // the .sig file is ALSO base64(minisign sig FILE) — unwrap both layers
           const sigFileTextDecoded = b64d(sigFileText).toString();
           const sigBodyLine = sigFileTextDecoded.split('\n').filter(l => l && !l.startsWith('untrusted'))[0];
@@ -140,7 +152,7 @@ jobs:
           set -euo pipefail
           REPO="${GITHUB_REPOSITORY}"
           BASE="https://github.com/${REPO}/releases/download/${TAG}"
-          SIG=$(base64 < "src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz.sig" | tr -d '\n')
+          SIG=$(base64 < "$BUNDLE/macos/Daisy Cluster.app.tar.gz.sig" | tr -d '\n')
           python3 - "$VERSION" "$BASE" "$SIG" <<'EOF'
           import json, sys
           version, base, sig = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -160,15 +172,18 @@ jobs:
           print(json.dumps(feed, indent=2))
           EOF
           shasum -a 256 \
-            "src-tauri/target/release/bundle/dmg/Daisy Cluster_${VERSION}_aarch64.dmg" \
-            "src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz" \
+            $BUNDLE/dmg/*.dmg \
+            "$BUNDLE/macos/Daisy Cluster.app.tar.gz" \
             > SHA256SUMS.txt
 
       - name: Rename artifacts for the release (no spaces)
         run: |
           set -euo pipefail
-          cd src-tauri/target/release/bundle
-          cp "dmg/Daisy Cluster_${VERSION}_aarch64.dmg" "Daisy.Cluster_${VERSION}_aarch64.dmg"
+          cd "$BUNDLE"
+          # The DMG is named with the app version from tauri.conf.json (0.1.0),
+          # which may differ from the release tag — glob the real file.
+          DMG=$(ls dmg/*.dmg)
+          cp "$DMG" "Daisy.Cluster_${VERSION}_aarch64.dmg"
           cp "macos/Daisy Cluster.app.tar.gz" "Daisy.Cluster.app.tar.gz"
           cp "macos/Daisy Cluster.app.tar.gz.sig" "Daisy.Cluster.app.tar.gz.sig"
 
@@ -181,8 +196,8 @@ jobs:
           prerelease: ${{ contains(env.TAG, '-') }}
           fail_on_unmatched_files: true
           files: |
-            src-tauri/target/release/bundle/Daisy.Cluster_${{ env.VERSION }}_aarch64.dmg
-            src-tauri/target/release/bundle/Daisy.Cluster.app.tar.gz
-            src-tauri/target/release/bundle/Daisy.Cluster.app.tar.gz.sig
+            ${{ env.BUNDLE }}/Daisy.Cluster_*_aarch64.dmg
+            ${{ env.BUNDLE }}/Daisy.Cluster.app.tar.gz
+            ${{ env.BUNDLE }}/Daisy.Cluster.app.tar.gz.sig
             latest.json
             SHA256SUMS.txt

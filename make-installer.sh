@@ -46,8 +46,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$ROOT/src-tauri/target/release"
 APP_NAME="Daisy Cluster.app"
+# Universal-binary builds land in target/universal-apple-darwin/release (the
+# appdata payload is identical either way — only the binary and bundle differ).
+SRC="$ROOT/src-tauri/target/release"
+if [ -n "${TAURI_UNIVERSAL:-}" ] && [ -d "$ROOT/src-tauri/target/universal-apple-darwin/release/bundle/macos/$APP_NAME" ]; then
+  SRC="$ROOT/src-tauri/target/universal-apple-darwin/release"
+fi
 BUNDLED="$SRC/bundle/macos/$APP_NAME"
 INSTALLED="/Applications/$APP_NAME"
 # Portable node resolution — see clusterctl.sh for why /usr/local/bin alone
@@ -105,7 +110,15 @@ if [ -z "$VERIFY_ONLY" ]; then
 
 if [ "${1:-}" != "--skip" ]; then
   echo "▶ 1/5 tauri build (release; takes minutes)…"
-  npx --prefix "$ROOT/ui" tauri build 2>&1 | tail -4
+  if [ -n "${TAURI_UNIVERSAL:-}" ]; then
+    # Universal (arm64 + x86_64) build for distributable artifacts. CI runs
+    # this via the installer workflow so one DMG serves both Apple chips.
+    mkdir -p "$ROOT/src-tauri/target"
+    rustup target add x86_64-apple-darwin aarch64-apple-darwin
+    npx --prefix "$ROOT/ui" tauri build --target universal-apple-darwin 2>&1 | tail -4
+  else
+    npx --prefix "$ROOT/ui" tauri build 2>&1 | tail -4
+  fi
 else
   echo "▶ 1/5 skipped (--skip)"
 fi
@@ -141,8 +154,14 @@ EOF
   rm -f "$ENTITLEMENTS"
   codesign --verify --strict "$BUNDLED"   # fail the build on a bad signature
 else
-  codesign --force -s - "$BUNDLED" 2>/dev/null || true
+  # Ad-hoc seal of the .app bundle. This MUST succeed and MUST be verified:
+  # without _CodeSignature/, Gatekeeper refuses the app as damaged on any
+  # clean Mac ("code has no resources but signature indicates they must be
+  # present"). Never swallow failures here — a CI build shipped unsealed once.
+  codesign --force --deep -s - "$BUNDLED"
 fi
+codesign --verify --strict "$BUNDLED"
+[ -d "$BUNDLED/Contents/_CodeSignature" ] || { echo "FATAL: bundle not sealed (_CodeSignature missing)" >&2; exit 1; }
 
 echo "▶ 4/5 installing to ${INSTALLED}…" # brace the var: bash parses $INSTALLED… (ellipsis) as one name under set -u
 [ -d "$INSTALLED" ] && rm -rf "$INSTALLED"
