@@ -50,7 +50,9 @@ APP_NAME="Daisy Cluster.app"
 # Universal-binary builds land in target/universal-apple-darwin/release (the
 # appdata payload is identical either way — only the binary and bundle differ).
 SRC="$ROOT/src-tauri/target/release"
-if [ -n "${TAURI_UNIVERSAL:-}" ] && [ -d "$ROOT/src-tauri/target/universal-apple-darwin/release/bundle/macos/$APP_NAME" ]; then
+if [ -n "${TAURI_UNIVERSAL:-}" ]; then
+  # Must be decided BEFORE the build: the universal bundle only exists after
+  # `tauri build --target universal-apple-darwin` runs below.
   SRC="$ROOT/src-tauri/target/universal-apple-darwin/release"
 fi
 BUNDLED="$SRC/bundle/macos/$APP_NAME"
