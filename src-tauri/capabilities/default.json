@@ -2,5 +2,5 @@
   "identifier": "default",
   "description": "Core permissions for the telemetry window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "process:allow-restart", "process:allow-exit"]
 }

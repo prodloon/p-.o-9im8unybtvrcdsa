@@ -56,6 +56,15 @@ export async function subscribeShellAlert(onAlert) {
   return listen('shell://no-node', (event) => onAlert(String(event.payload || '')));
 }
 
+/** Updater channel: the Rust host emits `shell://update-ready` after it has
+ *  downloaded, signature-verified, and STAGED an update (applied on relaunch).
+ *  Returns unlisten, or null in plain-browser mode. */
+export async function subscribeUpdateReady(onReady) {
+  if (!isTauri()) return null;
+  const { listen } = await import('@tauri-apps/api/event');
+  return listen('shell://update-ready', (event) => onReady(String(event.payload || '')));
+}
+
 /** Buffer + throttle helper: returns a feed function that commits at most `hz` times/sec. */
 export function createThrottledFeed(onCommit, intervalMs = 500) {
   let buffer = null;
