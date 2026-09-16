@@ -256,6 +256,32 @@ def suite_shell_artifacts():
     check("shell", "cargo check passes", cargo.returncode == 0,
           cargo.stderr.strip().splitlines()[-1] if cargo.returncode else "")
 
+    # Updater event lifecycle: the shell must emit update-available BEFORE
+    # update-ready (the UI's banner-supersede logic depends on this order),
+    # with the exact event names App.jsx subscribes to, and messages built
+    # through the extracted pure helpers (so format changes stay consistent
+    # between code and battery). Static assertions on the source keep this
+    # honest without spawning a webview.
+    main_rs = open(os.path.join(ROOT, "src-tauri", "src", "main.rs")).read()
+    app_jsx = open(os.path.join(ROOT, "ui", "src", "App.jsx")).read()
+    telemetry_js = open(os.path.join(ROOT, "ui", "src", "telemetry.js")).read()
+
+    check("shell", "updater emits both lifecycle events",
+          "UPDATE_EVENT_AVAILABLE" in main_rs and "UPDATE_EVENT_READY" in main_rs)
+    check("shell", "update-available fires before update-ready",
+          0 < main_rs.find("UPDATE_EVENT_AVAILABLE") < main_rs.find("UPDATE_EVENT_READY")
+          and main_rs.find("UPDATE_EVENT_READY", main_rs.find("download_and_install")) > -1)
+    check("shell", "available event fires before download_and_install",
+          main_rs.find("UPDATE_EVENT_AVAILABLE") < main_rs.find("download_and_install"))
+    check("shell", "update messages built via pure helpers",
+          "fn update_available_msg(" in main_rs and "fn update_ready_msg(" in main_rs
+          and 'format!("Daisy Cluster {current} → {new}' in main_rs.replace("'" , "'"))
+    check("shell", "UI subscribes to both update events",
+          "subscribeUpdateAvailable" in telemetry_js and "subscribeUpdateReady" in telemetry_js
+          and "'shell://update-available'" in telemetry_js and "'shell://update-ready'" in telemetry_js)
+    check("shell", "UI renders both update banners",
+          "updateAvailable && !updateReady" in app_jsx and "updateReady && (" in app_jsx)
+
 
 def suite_control_script():
     """clusterctl.sh — the single control surface (start/stop/status/logs)."""

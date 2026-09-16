@@ -169,6 +169,22 @@ fn read_telemetry(root: &PathBuf) -> Option<serde_json::Value> {
 /// Best-effort macOS notification for telemetry outages (app-mode twin of the
 /// telemetry-server watcher's notifyOutage; DAISY_ALERT=0 silences upstream —
 /// the println log line always fires). Must never block or crash the shell.
+/// Update lifecycle event names, in the order the shell must emit them:
+/// feed check finds a newer version → download+verify completes → staged.
+/// The UI's banner logic (App.jsx) depends on this order — `update-ready`
+/// supersedes `update-available` — so the battery asserts both the names
+/// and their ordering (see suite_shell_artifacts).
+const UPDATE_EVENT_AVAILABLE: &str = "shell://update-available";
+const UPDATE_EVENT_READY: &str = "shell://update-ready";
+
+/// Banner messages for the two update lifecycle events (pure — unit-checkable).
+fn update_available_msg(current: &str, new: &str) -> String {
+    format!("Daisy Cluster {current} → {new} — downloading in the background…")
+}
+fn update_ready_msg(new: &str) -> String {
+    format!("Daisy Cluster {new} is ready — relaunch the app to install it.")
+}
+
 fn notify_outage(msg: &str, urgent: bool) {
     if !cfg!(target_os = "macos") {
         return;
@@ -245,11 +261,8 @@ fn main() {
                             {
                                 use tauri::Emitter;
                                 let _ = handle.emit(
-                                    "shell://update-available",
-                                    format!(
-                                        "Daisy Cluster {} → {} — downloading in the background…",
-                                        update.current_version, update.version
-                                    ),
+                                    UPDATE_EVENT_AVAILABLE,
+                                    update_available_msg(&update.current_version, &update.version),
                                 );
                             }
                             notify_outage(
@@ -264,11 +277,8 @@ fn main() {
                                     println!("[shell] update staged — takes effect on relaunch");
                                     use tauri::Emitter;
                                     let _ = handle.emit(
-                                        "shell://update-ready",
-                                        format!(
-                                            "Daisy Cluster {} is ready — relaunch the app to install it.",
-                                            update.version
-                                        ),
+                                        UPDATE_EVENT_READY,
+                                        update_ready_msg(&update.version),
                                     );
                                 }
                                 Err(e) => println!("[shell] update install failed: {e}"),
