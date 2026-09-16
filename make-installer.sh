@@ -174,9 +174,9 @@ if [ -n "${TAURI_UNIVERSAL:-}" ]; then
   DMG_SRC="$(mktemp -d /tmp/daisy-dmg-src.XXXXXX)"
   cp -R "$BUNDLED" "$DMG_SRC/"
   ln -s /Applications "$DMG_SRC/Applications"
-  rm -f "$SRC/bundle/dmg/$APP_NAME"_*.dmg
+  rm -f "$SRC/bundle/dmg/"*.dmg
   hdiutil create -volname "Daisy Cluster" -srcfolder "$DMG_SRC" \
-    -format UDZO -ov "$SRC/bundle/dmg/Daisy Cluster_$(print "%s" "${DAISY_APP_VERSION:-0.1.0}")_universal.dmg"
+    -format UDZO -ov "$SRC/bundle/dmg/Daisy Cluster_$(printf '%s' "${DAISY_APP_VERSION:-0.1.0}")_universal.dmg"
   rm -rf "$DMG_SRC"
   codesign --verify --strict "$DMG_SRC/../$APP_NAME" 2>/dev/null || true
 fi
