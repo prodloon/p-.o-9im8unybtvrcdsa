@@ -201,3 +201,107 @@ jobs:
             ${{ env.BUNDLE }}/Daisy.Cluster.app.tar.gz.sig
             latest.json
             SHA256SUMS.txt
+
+  # ─── Release smoke test ───────────────────────────────────────────────────
+  # The rc1–rc3 smoke tests each caught a real shipping bug (arm64-only build,
+  # unsealed bundle, stale pre-sign DMG). This job makes those checks part of
+  # every release: it re-downloads the artifacts from the PUBLISHED release
+  # URL — not the local build dir — so it validates what a recipient actually
+  # gets, including the upload itself.
+  smoke-test:
+    runs-on: macos-14
+    needs: release
+    timeout-minutes: 10
+    steps:
+      - name: Resolve release tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download the published artifacts (as a recipient would)
+        run: |
+          set -euo pipefail
+          mkdir published && cd published
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          for f in Daisy.Cluster_*_aarch64.dmg Daisy.Cluster.app.tar.gz \
+                   Daisy.Cluster.app.tar.gz.sig latest.json SHA256SUMS.txt; do
+            curl -sSL -f -O "$BASE/$f"
+          done
+          ls -la
+
+      - name: Verify SHA256SUMS matches the published files
+        run: |
+          set -euo pipefail
+          cd published
+          # SHA256SUMS entries carry build-dir paths; compare digests, not names.
+          python3 - <<'EOF'
+          import hashlib, re, sys
+          expected = {}
+          for line in open('SHA256SUMS.txt'):
+              digest, path = line.split(maxsplit=1)
+              expected[path.strip()] = digest
+          def sha(p):
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+          got = {
+              'dmg': sha(next(p for p in __import__('glob').glob('Daisy.Cluster_*_aarch64.dmg'))),
+              'tar': sha('Daisy.Cluster.app.tar.gz'),
+          }
+          want_dmg = next(d for p, d in expected.items() if p.endswith('.dmg'))
+          want_tar = next(d for p, d in expected.items() if p.endswith('app.tar.gz'))
+          ok = got['dmg'] == want_dmg and got['tar'] == want_tar
+          print(f"dmg sha256 {'✓' if got['dmg'] == want_dmg else '✗ MISMATCH'}")
+          print(f"tar sha256 {'✓' if got['tar'] == want_tar else '✗ MISMATCH'}")
+          sys.exit(0 if ok else 1)
+          EOF
+
+      - name: Mount DMG and verify the app seal under quarantine
+        run: |
+          set -euo pipefail
+          cd published
+          DMG=$(ls Daisy.Cluster_*_aarch64.dmg)
+          hdiutil attach "$DMG" -nobrowse -quiet
+          APP="/Volumes/Daisy Cluster/Daisy Cluster.app"
+          cp -R "$APP" ./smoke.app
+          hdiutil detach "/Volumes/Daisy Cluster" -quiet
+          # Simulate a browser download so Gatekeeper's path is exercised.
+          xattr -w com.apple.quarantine "0081;00000000;GitHub Actions;" smoke.app
+          # The seal: exactly the check the rc1/rc2 DMGs failed.
+          codesign --verify --strict smoke.app
+          test -d smoke.app/Contents/_CodeSignature
+          echo "✓ published DMG app is sealed and strict-verifies under quarantine"
+
+      - name: Verify universal binary (x86_64 + arm64)
+        run: |
+          set -euo pipefail
+          cd published
+          ARCHS=$(lipo -archs smoke.app/Contents/MacOS/daisy-cluster)
+          echo "architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw x86_64
+          echo "$ARCHS" | grep -qw arm64
+          echo "✓ universal binary confirmed"
+
+      - name: Verify latest.json signature matches the published tarball
+        run: |
+          set -euo pipefail
+          cd published
+          python3 - <<'EOF'
+          import base64, hashlib, json, sys
+          feed = json.load(open('latest.json'))
+          plat = feed['platforms']['darwin-aarch64']
+          assert 'Daisy.Cluster.app.tar.gz' in plat['url'], f"feed URL wrong: {plat['url']}"
+          # Tauri .sig == base64(minisign text); feed carries the same base64.
+          sig_file = base64.b64encode(open('Daisy.Cluster.app.tar.gz.sig','rb').read()).decode()
+          assert plat['signature'] == sig_file, 'feed signature does not match published .sig'
+          # And the tarball the feed points at must be the one signed.
+          import hashlib
+          digest = hashlib.sha256(open('Daisy.Cluster.app.tar.gz','rb').read()).hexdigest()
+          sums = open('SHA256SUMS.txt').read()
+          assert digest in sums, 'published tarball not covered by SHA256SUMS'
+          print(f"✓ feed version {feed['version']} — signature + URL + digest consistent")
+          EOF
+
