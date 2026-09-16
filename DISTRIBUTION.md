@@ -137,6 +137,52 @@ with how long the outage lasted.
 
 ---
 
+## Giving the cluster work (task payload contract)
+
+Tasks are JSON enqueued through `clusterctl.sh` (headless) or the app's queue. A task needs **three** fields to do something real:
+
+```bash
+./clusterctl.sh task '{
+  "kind": "generic",
+  "payload": {
+    "summary": "Scaffold a small express api with a health endpoint",
+    "action": "scaffold",              // required: what the worker does
+    "params": { "name": "my-api", "kind": "node-api" },
+    "needsSkill": true                 // optional: run the SNIPE skill consult first
+  }
+}'
+```
+
+- **`action`** (required) — one of the worker's deterministic actions:
+  `list_files`, `read_file`, `write_file`, `append_file`, `delete_file`,
+  `mkdir`, `file_stats`, `scaffold`, `http_get_json`, `SNIPE`.
+  A summary with no action fails 3× and poisons (`unknown action ''`).
+- **`params`** — the action's arguments (see the examples below; wrong
+  params fail per-attempt, e.g. `http_get_json` refuses non-http(s) URLs).
+- **`needsSkill: true`** — the SNIPE gate: the worker refuses to act until
+  the supervisor cascade (T1 template → T2 Ollama → T3 cloud) injects a
+  skill or declines. Omit it for pure mechanical tasks.
+- **`summary`** — phrased to match a skill's trigger words, it routes at
+  T1 (free). Triggers live in `skillbase/index.json`, e.g. scaffold / api /
+  rest for the express scaffold, rename / bulk / batch for bulk renames,
+  route / map / audit for route inventories.
+
+Copy-paste examples:
+
+```bash
+# Scaffold a project (SNIPE cascade, T1 hit on 'scaffold'/'api')
+./clusterctl.sh task '{"kind":"generic","payload":{"summary":"scaffold an express api","needsSkill":true,"action":"scaffold","params":{"name":"demo-api","kind":"node-api"}}}'
+
+# List files in the sandbox
+./clusterctl.sh task '{"kind":"generic","payload":{"summary":"list the files","action":"list_files","params":{"dir":"."}}}'
+
+# Fetch JSON over HTTP
+./clusterctl.sh task '{"kind":"generic","payload":{"summary":"fetch json over http","action":"http_get_json","params":{"url":"https://api.github.com/zen"}}}'
+```
+
+Watch it run: `./clusterctl.sh logs orchestrator 50` (look for
+`task N → tier1-template`), or the dashboard's pipeline panel.
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |

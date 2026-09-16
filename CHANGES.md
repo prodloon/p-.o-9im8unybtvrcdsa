@@ -1,5 +1,29 @@
 # Round 8 — 2026-09-15
 
+# Round 8 — 2026-09-15 (continued)
+
+## Regression test for the round4-class telemetry crash + tier-3 re-pin + payload docs
+
+- **New S15 checks (3):** `writeTelemetryFile()` must land a parseable
+  `telemetry.json` in `DAISY_DATA_DIR` containing `costs.burnProjection`.
+  Catches any scoping bug inside the telemetry path that the
+  swallow-own-errors wrapper would otherwise hide. Mutation-tested:
+  reintroducing the original round4 bug makes the check fail
+  ("WOULD FAIL — bug caught"). Backend battery 189 → **192 checks**;
+  cluster harness pin updated to match.
+- **Tier-3 re-pinned to the versioned slug** `anthropic/claude-sonnet-5`
+  (was `~anthropic/claude-sonnet-latest`). Live-verified today: the alias
+  resolves to sonnet-5 at the exact rate card already in POLICY ($2/M
+  prompt, $10/M completion), and knowledge.md's live run hit sonnet-5 4/4
+  via override. Versioned slugs cannot silently retarget; aliases can —
+  the entire reason this pin exists. Rate card confirmed unchanged.
+- **Task payload contract documented** in DISTRIBUTION.md: `action`,
+  `params`, `needsSkill` semantics (learned live this session — a summary
+  with no action poison-fails 3x), trigger-word routing at T1, and three
+  copy-paste `clusterctl.sh task` examples.
+
+Batteries: backend 192/192, cluster 76/76 all A (fast).
+
 ## Updater signing keypair generated; updater artifacts re-enabled
 
 - **Keypair:** `~/.tauri-daisy-keys/daisy-updater.key(.pub)` via

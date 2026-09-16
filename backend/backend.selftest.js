@@ -581,6 +581,32 @@ async function main() {
 
       const tel = orch.telemetry();
       check('telemetry carries the costs block for the dashboard', tel.costs && typeof tel.costs.unitT3Usd === 'number' && !!tel.costs.method && tel.costs.totals.consults >= 1);
+
+      // Regression (round4 class): writeTelemetryFile() swallows its own
+      // errors, so a scoping bug inside telemetry()/costRollup() once made
+      // EVERY 1 Hz write fail silently ("round4 is not defined" ×38) and the
+      // dashboard never noticed. Assert the write actually lands a fresh,
+      // parseable telemetry.json in DAISY_DATA_DIR.
+      const telDir = path.join(env.tmp, 'database');
+      process.env.DAISY_DATA_DIR = telDir;
+      try {
+        delete require.cache[require.resolve('./index.js')];
+        const { Orchestrator: O2 } = require('./index.js'); // re-read TELEMETRY_FILE from env
+        const orch2 = new O2({ governor: env.governor, root: env.tmp, skillbaseDir: SKILL_DIR, bridge, verbose: false, sandboxRoot: path.join(env.tmp, 'sandbox') });
+        orch2.writeTelemetryFile();
+        const telPath = path.join(telDir, 'telemetry.json');
+        const wrote = fs.existsSync(telPath);
+        check('writeTelemetryFile() lands telemetry.json in DAISY_DATA_DIR', wrote);
+        if (wrote) {
+          const parsed = JSON.parse(fs.readFileSync(telPath, 'utf8'));
+          check('written telemetry parses with costs + burnProjection (no silent write failure)', parsed.ts > 0 && !!parsed.costs && !!parsed.costs.burnProjection && !!parsed.costs.burnProjection.method, JSON.stringify(Object.keys(parsed)));
+          check('burnProjection is an object with a method string (would throw at write time if scope-broken)', typeof parsed.costs.burnProjection.method === 'string' && parsed.costs.burnProjection.method.length > 0);
+        }
+        orch2.close();
+      } finally {
+        delete process.env.DAISY_DATA_DIR;
+        delete require.cache[require.resolve('./index.js')];
+      }
       orch.close();
     } finally {
       env.cleanup();

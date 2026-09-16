@@ -6,11 +6,15 @@
  * 3-Tier cascade (knowledge.md §5.5 COST LAW — permanent model mappings):
  *   Tier 1: skillbase/ regex + markdown + JSON trigger templates — $0 (routeTask)
  *   Tier 2: local Ollama qwen2.5:7b at http://localhost:11434 — $0 (triage)
- *   Tier 3: OpenRouter ~anthropic/claude-sonnet-latest — frontier brain, exclusive
+ *   Tier 3: OpenRouter anthropic/claude-sonnet-5 — frontier brain, exclusive
  *
  * The three model mappings are PINNED here and are NOT env-overridable:
  * this exists so no future session can silently re-pin a dead slug (the
  * original claude-3.5-sonnet pin rotted while the fallback masked it).
+ * Pinned to the VERSIONED claude-sonnet-5 slug (2026-09-15, live-verified
+ * 4/4 verdicts + pricing check: $2/M prompt, $10/M completion — same rate
+ * card as POLICY below). The ~latest alias retargets silently; versioned
+ * slugs cannot.
  * Only OLLAMA_TIMEOUT_MS remains tunable (performance, not mapping).
  *
  * Contract (knowledge.md §5):
@@ -46,7 +50,7 @@ const POLICY = {
   })(),
   OLLAMA_MAX_TOKENS: 220,
   // Tier 3: frontier brain via OpenRouter — exclusive, no cloud fallback
-  TIER3_MODEL: '~anthropic/claude-sonnet-latest', // PINNED — live-verified alias, no env override
+  TIER3_MODEL: 'anthropic/claude-sonnet-5', // PINNED — versioned slug, live-verified 2026-09-15; no env override
   // Confidence-score dynamic escalation: the T2 triage self-assesses every
   // verdict; a BORDERLINE one (below this floor) is re-asked at the frontier
   // instead of being trusted blindly. Applies to T2 ONLY — T1's confidence
