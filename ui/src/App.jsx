@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { subscribeTelemetry, subscribeShellAlert, subscribeUpdateReady, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
+import { subscribeTelemetry, subscribeShellAlert, subscribeUpdateAvailable, subscribeUpdateReady, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
 
 const MAX_HISTORY = 60; // ~60s of samples at 1Hz
 
@@ -304,12 +304,23 @@ export default function App() {
     return () => { if (unlisten) unlisten(); };
   }, []);
 
-  // Update ready: the shell downloaded, verified, and STAGED an update;
-  // relaunching the app applies it. Offer a one-click relaunch.
+  // Update lifecycle: `update-available` when a feed check finds a newer
+  // version (download starting — informational, auto-clears when the update
+  // is staged), `update-ready` when it's verified and staged (relaunch
+  // applies it). Offer a one-click relaunch on ready.
+  const [updateAvailable, setUpdateAvailable] = useState(null);
+  useEffect(() => {
+    let unlisten = null;
+    subscribeUpdateAvailable(setUpdateAvailable).then((fn) => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  }, []);
   const [updateReady, setUpdateReady] = useState(null);
   useEffect(() => {
     let unlisten = null;
-    subscribeUpdateReady(setUpdateReady).then((fn) => { unlisten = fn; });
+    subscribeUpdateReady((msg) => {
+      setUpdateAvailable(null); // download finished — the ready banner supersedes
+      setUpdateReady(msg);
+    }).then((fn) => { unlisten = fn; });
     return () => { if (unlisten) unlisten(); };
   }, []);
 
@@ -343,6 +354,13 @@ export default function App() {
         <div className="mb-4 flex items-center gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
           <span className="text-lg">⚠️</span>
           <span>{shellAlert}</span>
+        </div>
+      )}
+      {updateAvailable && !updateReady && (
+        <div className="mb-4 flex items-center gap-3 rounded-xl border border-sky-500/40 bg-sky-500/10 px-4 py-3 text-sm text-sky-200">
+          <span className="text-lg">⬇️</span>
+          <span>{updateAvailable}</span>
+          <span className="ml-auto inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400" title="downloading" />
         </div>
       )}
       {updateReady && (

@@ -56,9 +56,17 @@ export async function subscribeShellAlert(onAlert) {
   return listen('shell://no-node', (event) => onAlert(String(event.payload || '')));
 }
 
-/** Updater channel: the Rust host emits `shell://update-ready` after it has
- *  downloaded, signature-verified, and STAGED an update (applied on relaunch).
+/** Updater channels: the Rust host emits `shell://update-available` when a
+ *  feed check finds a newer version (download starting), and
+ *  `shell://update-ready` after the update has been downloaded,
+ *  signature-verified, and STAGED (applied on relaunch).
  *  Returns unlisten, or null in plain-browser mode. */
+export async function subscribeUpdateAvailable(onAvailable) {
+  if (!isTauri()) return null;
+  const { listen } = await import('@tauri-apps/api/event');
+  return listen('shell://update-available', (event) => onAvailable(String(event.payload || '')));
+}
+
 export async function subscribeUpdateReady(onReady) {
   if (!isTauri()) return null;
   const { listen } = await import('@tauri-apps/api/event');

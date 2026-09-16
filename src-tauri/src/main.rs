@@ -238,6 +238,27 @@ fn main() {
                                 "[shell] update available: {} → {} — downloading…",
                                 update.current_version, update.version
                             );
+                            // Tell the UI (and, if the window is closed/hidden,
+                            // the user via Notification Center) that an update
+                            // was found BEFORE the download completes — a large
+                            // download shouldn't appear to come from nowhere.
+                            {
+                                use tauri::Emitter;
+                                let _ = handle.emit(
+                                    "shell://update-available",
+                                    format!(
+                                        "Daisy Cluster {} → {} — downloading in the background…",
+                                        update.current_version, update.version
+                                    ),
+                                );
+                            }
+                            notify_outage(
+                                &format!(
+                                    "Update {} → {} found — downloading",
+                                    update.current_version, update.version
+                                ),
+                                false,
+                            );
                             match update.download_and_install(|_, _| {}, || {}).await {
                                 Ok(()) => {
                                     println!("[shell] update staged — takes effect on relaunch");
