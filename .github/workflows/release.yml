@@ -123,7 +123,7 @@ jobs:
           const tar = fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz');
           const sigFileText = fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz.sig', 'utf8');
           // the .sig file is ALSO base64(minisign sig FILE) — unwrap both layers
-          const sigFileTextDecoded = b64d(sigFile).toString();
+          const sigFileTextDecoded = b64d(sigFileText).toString();
           const sigBodyLine = sigFileTextDecoded.split('\n').filter(l => l && !l.startsWith('untrusted'))[0];
           const sigBody = b64d(sigBodyLine);
           if (!sigBody.slice(2,10).equals(pubBody.slice(2,10))) {
