@@ -35,6 +35,9 @@ const { SkillInjector } = require('./skill-injector');
 const { KeyHealthMonitor } = require('./key-health');
 const { T2Canary } = require('./t2-canary');
 
+/** Round to 4 decimal places — money formatting for cost rollups. */
+const round4 = (x) => Math.round(x * 10000) / 10000;
+
 const ORCH_POLICY = {
   TICK_MS: 2000,           // governor watchdog cadence (matches knowledge.md)
   LEASE_MS: 60000,         // per-task lease
@@ -426,7 +429,6 @@ class Orchestrator {
     const fb = rows['local-fallback'] || 0;
     const t3 = rows.supervisor || 0;
     const avoided = t1 + t2 + fb;
-    const round4 = (x) => Math.round(x * 10000) / 10000;
     return {
       unitT3Usd: round4(unit),
       perTier: {
