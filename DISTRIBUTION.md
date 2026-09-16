@@ -232,6 +232,7 @@ What happens automatically:
 
 - **With the secret set:** `tauri build` produces `*.app.tar.gz` + `.sig` alongside the DMG; the release workflow attaches them and publishes `latest.json` — installed apps check the updater endpoint and self-update with signature verification.
 - **Without the secret:** CI disables `createUpdaterArtifacts` before building, so builds and CI stay green; the updater simply has no new artifacts to serve.
+- **Private repo caveat (current state):** the updater fetches the feed anonymously, and GitHub release assets in a **private** repo 404 for anonymous requests. While the repo is private, the self-update check fails non-fatally (`updater check failed`) on every install — detection, verification, and staging were all proven live against a public-feed simulation (rc3/rc4 work). Self-updates start working the moment the repo is made public, or if `latest.json` is hosted on a public URL (S3/R2/gist) and put in `plugins.updater.endpoints`.
 
 If the private key is lost, releases already published remain installable, but no further signed updates can be issued — rotate by generating a new keypair and shipping one final "re-install" release with the new pubkey.
 
