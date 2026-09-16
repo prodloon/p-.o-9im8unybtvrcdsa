@@ -289,7 +289,13 @@ jobs:
           # The seal: exactly the check the rc1/rc2 DMGs failed.
           codesign --verify --strict smoke.app
           test -d smoke.app/Contents/_CodeSignature
+          # The runtime payload must ship inside the bundle: without
+          # Resources/appdata/backend/index.js an updated app can't spawn its
+          # orchestrator (the exact bug this guards against — updater tarballs
+          # were built before appdata staging).
+          test -f smoke.app/Contents/Resources/appdata/backend/index.js
           echo "✓ published DMG app is sealed and strict-verifies under quarantine"
+          echo "✓ runtime payload (appdata/backend) present in the bundle"
 
       - name: Verify universal binary (x86_64 + arm64)
         run: |

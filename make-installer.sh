@@ -128,11 +128,15 @@ fi
 echo "▶ 2/5 staging runtime payload into Contents/Resources/appdata…"
 mkdir -p "$BUNDLED/Contents/Resources/appdata"
 cd "$ROOT"
-rsync -a \
+# --delete-excluded: macOS rsync 2.6.9 protects excluded dirs from --delete,
+# so stale build artifacts (e.g. a leftover .ci-cargo-target) would persist in
+# the bundle forever. Excluded things must not exist in the bundle at all.
+rsync -a --delete --delete-excluded \
   --exclude '.git*' --exclude 'node_modules' --exclude 'daisy_env' \
   --exclude 'ui' --exclude 'src-tauri' --exclude 'logs' --exclude '.run' \
   --exclude 'daisy_sandbox*' --exclude 'database' --exclude 'docs' \
   --exclude '.env' --exclude '.DS_Store' \
+  --exclude '.ci-cargo-target' \
   ./ "$BUNDLED/Contents/Resources/appdata/"
 
 echo "▶ 3/5 swapping in the freshly built binary + $([ -n "$SIGN_IDENTITY" ] && echo 'Developer ID' || echo 'ad-hoc') sign…"
@@ -165,20 +169,38 @@ fi
 codesign --verify --strict "$BUNDLED"
 [ -d "$BUNDLED/Contents/_CodeSignature" ] || { echo "FATAL: bundle not sealed (_CodeSignature missing)" >&2; exit 1; }
 
-# Rebuild the distributable DMG from the SEALED bundle. The DMG that tauri
-# build emits at stage 1 predates the binary swap + signing, so publishing it
-# would ship an unsealed app that Gatekeeper reports as damaged (exactly the
-# bug the rc2 smoke test caught). Only rebuilt in universal/release mode.
+# Rebuild the distributable DMG and the UPDATER TARBALL from the SEALED bundle.
+# Both tauri-build artifacts (bundle/dmg, bundle/macos/*.app.tar.gz) are produced
+# at stage 1 — BEFORE the appdata staging, binary swap, and signing in stages 2–3.
+# The DMG shipped unsealed once and the updater tarball would apply an update whose
+# bundle lacks Resources/appdata (backend can't spawn → updated app is dead on
+# arrival). Regenerate both from the final bundle. Universal/release mode only.
 if [ -n "${TAURI_UNIVERSAL:-}" ]; then
-  echo "▶ 3b/5 rebuilding DMG from the sealed bundle…"
+  echo "▶ 3b/5 rebuilding DMG + updater tarball from the sealed bundle…"
+  # Updater tarball: gzip-format archive of the .app, same shape tauri build emits.
+  TARBALL="$SRC/bundle/macos/$APP_NAME.tar.gz"
+  rm -f "$TARBALL" "$TARBALL.sig"
+  tar -czf "$TARBALL" -C "$SRC/bundle/macos" "$APP_NAME"
+  # Sign it with the updater key (required when createUpdaterArtifacts is on;
+  # TAURI_SIGNING_PRIVATE_KEY is already in env from the CI/release build).
+  if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+    ( cd "$ROOT/ui" && npx tauri signer sign -k "$TAURI_SIGNING_PRIVATE_KEY" \
+        ${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:+-p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"} \
+        "$TARBALL" >/dev/null )
+    [ -f "$TARBALL.sig" ] || { echo "FATAL: updater tarball signature missing" >&2; exit 1; }
+    echo "  ✔ updater tarball rebuilt + signed ($(du -h "$TARBALL" | cut -f1))"
+  else
+    echo "  ⚠ no TAURI_SIGNING_PRIVATE_KEY — updater tarball rebuilt but UNSIGNED" >&2
+  fi
+
   DMG_SRC="$(mktemp -d /tmp/daisy-dmg-src.XXXXXX)"
   cp -R "$BUNDLED" "$DMG_SRC/"
   ln -s /Applications "$DMG_SRC/Applications"
   rm -f "$SRC/bundle/dmg/"*.dmg
   hdiutil create -volname "Daisy Cluster" -srcfolder "$DMG_SRC" \
-    -format UDZO -ov "$SRC/bundle/dmg/Daisy Cluster_$(printf '%s' "${DAISY_APP_VERSION:-0.1.0}")_universal.dmg"
+    -format UDZO -ov "$SRC/bundle/dmg/Daisy Cluster_$(printf '%s' "${DAISY_APP_VERSION:-0.1.0}")_universal.dmg" >/dev/null
   rm -rf "$DMG_SRC"
-  codesign --verify --strict "$DMG_SRC/../$APP_NAME" 2>/dev/null || true
+  echo "  ✔ DMG rebuilt from the sealed bundle"
 fi
 
 echo "▶ 4/5 installing to ${INSTALLED}…" # brace the var: bash parses $INSTALLED… (ellipsis) as one name under set -u
