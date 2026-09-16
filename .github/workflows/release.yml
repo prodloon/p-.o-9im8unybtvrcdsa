@@ -1,0 +1,183 @@
+# Release pipeline — tag-gated, fully automatic.
+#
+# Pushing a v* tag:
+#   1. builds the installer via the same make-installer.sh stages CI uses
+#      (tauri build → stage appdata → ad-hoc sign → swap binary), with the
+#      updater signature applied at build time from
+#      TAURI_SIGNING_PRIVATE_KEY (updater artifacts require it — if the
+#      secret is missing the build FAILS here rather than shipping an
+#      unsigned updater silently);
+#   2. generates latest.json (the Tauri updater feed: version, platform,
+#      signature, download URL) from the produced artifacts;
+#   3. creates a GitHub release and attaches DMG + updater artifacts +
+#      latest.json + SHA256SUMS.
+#
+# Installed apps poll the latest.json endpoint (plugins.updater.endpoints
+# in tauri.conf.json points at this release's latest.json URL), verify the
+# minisign signature against the embedded pubkey, and self-update.
+#
+# The battery does NOT gate this job: pushes to main already run it on
+# every commit, and the tag points at a commit whose battery result is
+# known. If the battery is red, don't tag.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.0.1-rc2)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Resolve release version from the tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Set up Node (>=26 for node:sqlite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Pin node at /usr/local/bin/node (make-installer.sh hardcodes it)
+        run: |
+          set -euo pipefail
+          NODE_BIN="$(command -v node)"
+          sudo mkdir -p /usr/local/bin
+          if [ -e /usr/local/bin/node ] && [ ! -L /usr/local/bin/node ]; then
+            sudo mv /usr/local/bin/node /usr/local/bin/node.pre-daisy
+          fi
+          sudo ln -sf "$NODE_BIN" /usr/local/bin/node
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install dashboard deps
+        run: |
+          cd ui
+          npm ci --no-audit --no-fund
+
+      # The updater signature is REQUIRED for a release: a release whose
+      # updater artifacts are unsigned would break the updater promise the
+      # app makes. Fail loudly if the secret is missing.
+      - name: Require updater signing key
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "✗ TAURI_SIGNING_PRIVATE_KEY secret is not set — refusing to ship an unsigned release." >&2
+            echo "  Add it (base64 of the minisign key) in Settings → Secrets → Actions." >&2
+            exit 1
+          fi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+      - name: Build installer (stages 1–4, stage 5 skipped headless)
+        run: NO_APP_VERIFY=1 ./make-installer.sh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Verify updater signature against the embedded pubkey
+        run: |
+          set -euo pipefail
+          node - <<'EOF'
+          const fs = require('fs'), crypto = require('crypto');
+          function b64d(s){ s = s.replace(/\s+/g,''); return Buffer.from(s, 'base64'); }
+          const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+          const pub = b64d(conf.plugins.updater.pubkey).toString().split('\n')
+            .filter(l => l && !l.startsWith('untrusted'))[0];
+          const pubBody = b64d(pub);
+          const key = crypto.createPublicKey({
+            key: Buffer.concat([Buffer.from('302a300506032b6570032100','hex'), pubBody.slice(10)]),
+            format: 'der', type: 'spki',
+          });
+          const tar = fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz');
+          const sigBody = b64d(fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz.sig', 'utf8'));
+          if (!sigBody.slice(2,10).equals(pubBody.slice(2,10))) {
+            console.error('✗ key id mismatch'); process.exit(1);
+          }
+          const blake = crypto.createHash('blake2b512').update(tar).digest();
+          const ok = crypto.verify(null, blake, key, sigBody.slice(10));
+          if (!ok) { console.error('✗ updater signature INVALID'); process.exit(1); }
+          console.log('✓ updater signature valid against the embedded pubkey');
+          EOF
+
+      - name: Generate latest.json (Tauri updater feed)
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          SIG=$(base64 < "src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz.sig" | tr -d '\n')
+          python3 - "$VERSION" "$BASE" "$SIG" <<'EOF'
+          import json, sys
+          version, base, sig = sys.argv[1], sys.argv[2], sys.argv[3]
+          pub = json.load(open('src-tauri/tauri.conf.json'))['plugins']['updater']['pubkey']
+          feed = {
+            "version": version,
+            "notes": f"Daisy Cluster {version}",
+            "pub_date": __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": sig,
+                "url": f"{base}/Daisy.Cluster.app.tar.gz",
+              },
+            },
+          }
+          json.dump(feed, open('latest.json', 'w'), indent=2)
+          print(json.dumps(feed, indent=2))
+          EOF
+          shasum -a 256 \
+            "src-tauri/target/release/bundle/dmg/Daisy Cluster_${VERSION}_aarch64.dmg" \
+            "src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz" \
+            > SHA256SUMS.txt
+
+      - name: Rename artifacts for the release (no spaces)
+        run: |
+          set -euo pipefail
+          cd src-tauri/target/release/bundle
+          cp "dmg/Daisy Cluster_${VERSION}_aarch64.dmg" "Daisy.Cluster_${VERSION}_aarch64.dmg"
+          cp "macos/Daisy Cluster.app.tar.gz" "Daisy.Cluster.app.tar.gz"
+          cp "macos/Daisy Cluster.app.tar.gz.sig" "Daisy.Cluster.app.tar.gz.sig"
+
+      - name: Attach everything to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Daisy Cluster ${{ env.TAG }}
+          draft: false
+          prerelease: ${{ contains(env.TAG, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/Daisy.Cluster_${{ env.VERSION }}_aarch64.dmg
+            src-tauri/target/release/bundle/Daisy.Cluster.app.tar.gz
+            src-tauri/target/release/bundle/Daisy.Cluster.app.tar.gz.sig
+            latest.json
+            SHA256SUMS.txt
