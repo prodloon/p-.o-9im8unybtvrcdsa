@@ -84,9 +84,14 @@ jobs:
 
       # Suite 5 runs `cargo check` with a 600 s timeout inside the battery —
       # warm the cache in the same target dir the battery will use. Cache
-      # keyed on Cargo.lock + crates.
+      # keyed on Cargo.lock + crates. A stale restored build dir can hold
+      # references to files a newer tauri build script no longer emits
+      # (tauri-*/out/permissions/*.toml gone missing) — clear that dir so
+      # the build script regenerates it; registry/git caches stay warm.
       - name: Warm cargo cache (suite 5 has a 600 s timeout)
-        run: cargo check
+        run: |
+          rm -rf target/debug/build/tauri-*
+          cargo check
         working-directory: src-tauri
         timeout-minutes: 20
 
