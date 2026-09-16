@@ -165,6 +165,22 @@ fi
 codesign --verify --strict "$BUNDLED"
 [ -d "$BUNDLED/Contents/_CodeSignature" ] || { echo "FATAL: bundle not sealed (_CodeSignature missing)" >&2; exit 1; }
 
+# Rebuild the distributable DMG from the SEALED bundle. The DMG that tauri
+# build emits at stage 1 predates the binary swap + signing, so publishing it
+# would ship an unsealed app that Gatekeeper reports as damaged (exactly the
+# bug the rc2 smoke test caught). Only rebuilt in universal/release mode.
+if [ -n "${TAURI_UNIVERSAL:-}" ]; then
+  echo "▶ 3b/5 rebuilding DMG from the sealed bundle…"
+  DMG_SRC="$(mktemp -d /tmp/daisy-dmg-src.XXXXXX)"
+  cp -R "$BUNDLED" "$DMG_SRC/"
+  ln -s /Applications "$DMG_SRC/Applications"
+  rm -f "$SRC/bundle/dmg/$APP_NAME"_*.dmg
+  hdiutil create -volname "Daisy Cluster" -srcfolder "$DMG_SRC" \
+    -format UDZO -ov "$SRC/bundle/dmg/Daisy Cluster_$(print "%s" "${DAISY_APP_VERSION:-0.1.0}")_universal.dmg"
+  rm -rf "$DMG_SRC"
+  codesign --verify --strict "$DMG_SRC/../$APP_NAME" 2>/dev/null || true
+fi
+
 echo "▶ 4/5 installing to ${INSTALLED}…" # brace the var: bash parses $INSTALLED… (ellipsis) as one name under set -u
 [ -d "$INSTALLED" ] && rm -rf "$INSTALLED"
 ditto "$BUNDLED" "$INSTALLED"
