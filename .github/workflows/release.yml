@@ -112,15 +112,20 @@ jobs:
           const fs = require('fs'), crypto = require('crypto');
           function b64d(s){ s = s.replace(/\s+/g,''); return Buffer.from(s, 'base64'); }
           const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
-          const pub = b64d(conf.plugins.updater.pubkey).toString().split('\n')
-            .filter(l => l && !l.startsWith('untrusted'))[0];
-          const pubBody = b64d(pub);
+          // conf pubkey = base64(minisign pub FILE); the file's body line is base64(2-byte alg + 8-byte keyid + 32-byte key)
+          const pubFileText = b64d(conf.plugins.updater.pubkey).toString();
+          const pubBodyLine = pubFileText.split('\n').filter(l => l && !l.startsWith('untrusted'))[0];
+          const pubBody = b64d(pubBodyLine);
           const key = crypto.createPublicKey({
             key: Buffer.concat([Buffer.from('302a300506032b6570032100','hex'), pubBody.slice(10)]),
             format: 'der', type: 'spki',
           });
           const tar = fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz');
-          const sigBody = b64d(fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz.sig', 'utf8'));
+          const sigFileText = fs.readFileSync('src-tauri/target/release/bundle/macos/Daisy Cluster.app.tar.gz.sig', 'utf8');
+          // the .sig file is ALSO base64(minisign sig FILE) — unwrap both layers
+          const sigFileTextDecoded = b64d(sigFile).toString();
+          const sigBodyLine = sigFileTextDecoded.split('\n').filter(l => l && !l.startsWith('untrusted'))[0];
+          const sigBody = b64d(sigBodyLine);
           if (!sigBody.slice(2,10).equals(pubBody.slice(2,10))) {
             console.error('✗ key id mismatch'); process.exit(1);
           }
