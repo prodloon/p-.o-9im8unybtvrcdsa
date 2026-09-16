@@ -220,13 +220,15 @@ jobs:
           echo "TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Download the published artifacts (as a recipient would)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir published && cd published
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           for f in Daisy.Cluster_*_aarch64.dmg Daisy.Cluster.app.tar.gz \
                    Daisy.Cluster.app.tar.gz.sig latest.json SHA256SUMS.txt; do
-            curl -sSL -f -O "$BASE/$f"
+            curl -sSL -f -H "Authorization: Bearer ${GH_TOKEN}" -O "$BASE/$f"
           done
           ls -la
 
