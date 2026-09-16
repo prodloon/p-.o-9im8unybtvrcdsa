@@ -152,20 +152,27 @@ jobs:
           set -euo pipefail
           REPO="${GITHUB_REPOSITORY}"
           BASE="https://github.com/${REPO}/releases/download/${TAG}"
-          SIG=$(base64 < "$BUNDLE/macos/Daisy Cluster.app.tar.gz.sig" | tr -d '\n')
+          # The .sig file IS base64(minisign text) — the feed needs exactly
+          # that content; the updater base64-decodes it once to minisign text.
+          # (Wrapping again produces 'Invalid encoding in minisign data'.)
+          SIG=$(cat "$BUNDLE/macos/Daisy Cluster.app.tar.gz.sig" | tr -d '\n')
           python3 - "$VERSION" "$BASE" "$SIG" <<'EOF'
           import json, sys
           version, base, sig = sys.argv[1], sys.argv[2], sys.argv[3]
           pub = json.load(open('src-tauri/tauri.conf.json'))['plugins']['updater']['pubkey']
+          # The updater payload is a universal binary, so BOTH platform keys
+          # must point at it — a darwin-x86_64 app checking the feed must see
+          # the update too (the rc3 feed missed this; Intel installs never saw
+          # updates). Same tarball, same signature (signature covers bytes,
+          # not the platform key).
+          plat = {"signature": sig, "url": f"{base}/Daisy.Cluster.app.tar.gz"}
           feed = {
             "version": version,
             "notes": f"Daisy Cluster {version}",
             "pub_date": __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             "platforms": {
-              "darwin-aarch64": {
-                "signature": sig,
-                "url": f"{base}/Daisy.Cluster.app.tar.gz",
-              },
+              "darwin-aarch64": plat,
+              "darwin-x86_64": plat,
             },
           }
           json.dump(feed, open('latest.json', 'w'), indent=2)
@@ -304,7 +311,7 @@ jobs:
           plat = feed['platforms']['darwin-aarch64']
           assert 'Daisy.Cluster.app.tar.gz' in plat['url'], f"feed URL wrong: {plat['url']}"
           # Tauri .sig == base64(minisign text); feed carries the same base64.
-          sig_file = base64.b64encode(open('Daisy.Cluster.app.tar.gz.sig','rb').read()).decode()
+          sig_file = open('Daisy.Cluster.app.tar.gz.sig').read().strip()
           assert plat['signature'] == sig_file, 'feed signature does not match published .sig'
           # And the tarball the feed points at must be the one signed.
           import hashlib

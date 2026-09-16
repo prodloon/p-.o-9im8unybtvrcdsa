@@ -195,8 +195,8 @@ fn main() {
             }
         }))
         // Auto-update: check the release feed on launch (silent when
-        // up-to-date). Gated to signed release builds — dev/ad-hoc builds have
-        // no pubkey and would fail the signature check on every start.
+        // up-to-date). The check itself runs in setup() below; the plugin
+        // registration wires the endpoint + embedded pubkey.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(BackendHandle(Mutex::new(None)))
@@ -215,6 +215,52 @@ fn main() {
                 );
             }
             *app.state::<BackendHandle>().0.lock().unwrap() = child;
+
+            // 1b. Updater: query the release feed on launch. On a newer
+            // version, download + verify against the embedded pubkey, stage
+            // the update, and tell the user (relaunch applies it). Silent no-op
+            // when current, offline, or the feed is unreachable — an update
+            // failure must never block the shell from running.
+            {
+                let handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri_plugin_updater::UpdaterExt;
+                    let updater = match handle.updater() {
+                        Ok(u) => u,
+                        Err(e) => {
+                            println!("[shell] updater unavailable: {e}");
+                            return;
+                        }
+                    };
+                    match updater.check().await {
+                        Ok(Some(update)) => {
+                            println!(
+                                "[shell] update available: {} → {} — downloading…",
+                                update.current_version, update.version
+                            );
+                            match update.download_and_install(|_, _| {}, || {}).await {
+                                Ok(()) => {
+                                    println!("[shell] update staged — takes effect on relaunch");
+                                    use tauri::Emitter;
+                                    let _ = handle.emit(
+                                        "shell://update-ready",
+                                        format!(
+                                            "Daisy Cluster {} is ready — relaunch the app to install it.",
+                                            update.version
+                                        ),
+                                    );
+                                }
+                                Err(e) => println!("[shell] update install failed: {e}"),
+                            }
+                        }
+                        Ok(None) => println!(
+                            "[shell] updater: current (v{}) — no update on feed",
+                            handle.package_info().version
+                        ),
+                        Err(e) => println!("[shell] updater check failed (non-fatal): {e}"),
+                    }
+                });
+            }
 
             // 2. Telemetry emit loop (native IPC, 1 Hz) + outage watcher.
             // In app mode the shell tails telemetry.json itself — there is no
