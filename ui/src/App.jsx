@@ -305,10 +305,15 @@ export default function App() {
   }, []);
 
   // Update lifecycle: `update-available` when a feed check finds a newer
-  // version (download starting — informational, auto-clears when the update
-  // is staged), `update-ready` when it's verified and staged (relaunch
-  // applies it). Offer a one-click relaunch on ready.
+  // version (download starting), `update-ready` when it's verified and
+  // staged (relaunch applies it). Both banners are dismissible; dismissal
+  // is per-session (component state) and keyed by message content — a
+  // NEW update (different message) re-shows the banner even after a
+  // dismissal. `update-ready` deliberately has no dismiss button: an
+  // update staged but never applied would otherwise nag-forever OR be
+  // accidentally silenced forever — relaunching is the only real exit.
   const [updateAvailable, setUpdateAvailable] = useState(null);
+  const [availDismissed, setAvailDismissed] = useState(null); // dismissed message
   useEffect(() => {
     let unlisten = null;
     subscribeUpdateAvailable(setUpdateAvailable).then((fn) => { unlisten = fn; });
@@ -319,10 +324,12 @@ export default function App() {
     let unlisten = null;
     subscribeUpdateReady((msg) => {
       setUpdateAvailable(null); // download finished — the ready banner supersedes
+      setAvailDismissed(null);  // and reset the dismissal for the next cycle
       setUpdateReady(msg);
     }).then((fn) => { unlisten = fn; });
     return () => { if (unlisten) unlisten(); };
   }, []);
+  const showAvail = updateAvailable && !updateReady && updateAvailable !== availDismissed;
 
   // Heartbeat: staleness must be re-evaluated even when NO new samples
   // arrive — during an orchestrator outage the telemetry server still
@@ -356,11 +363,19 @@ export default function App() {
           <span>{shellAlert}</span>
         </div>
       )}
-      {updateAvailable && !updateReady && (
+      {showAvail && (
         <div className="mb-4 flex items-center gap-3 rounded-xl border border-sky-500/40 bg-sky-500/10 px-4 py-3 text-sm text-sky-200">
           <span className="text-lg">⬇️</span>
           <span>{updateAvailable}</span>
-          <span className="ml-auto inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400" title="downloading" />
+          <button
+            className="ml-auto rounded p-1 text-sky-300/60 hover:text-sky-200"
+            title="Dismiss for this session — a new update will notify again"
+            aria-label="Dismiss update-available banner"
+            onClick={() => setAvailDismissed(updateAvailable)}
+          >
+            ✕
+          </button>
+          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400" title="downloading" />
         </div>
       )}
       {updateReady && (

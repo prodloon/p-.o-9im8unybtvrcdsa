@@ -280,7 +280,14 @@ def suite_shell_artifacts():
           "subscribeUpdateAvailable" in telemetry_js and "subscribeUpdateReady" in telemetry_js
           and "'shell://update-available'" in telemetry_js and "'shell://update-ready'" in telemetry_js)
     check("shell", "UI renders both update banners",
-          "updateAvailable && !updateReady" in app_jsx and "updateReady && (" in app_jsx)
+          "showAvail &&" in app_jsx and "updateReady && (" in app_jsx)
+    check("shell", "available banner is dismissible per-session",
+          "setAvailDismissed(updateAvailable)" in app_jsx
+          and "availDismissed" in app_jsx and "setAvailDismissed(null)" in app_jsx)
+    check("shell", "ready banner is NOT dismissible (relaunch is the exit)",
+          "updateReady && (" in app_jsx
+          and app_jsx.count("setUpdateReady(null)") == 1
+          and ".catch(() => setUpdateReady(null))" in app_jsx)
 
 
 def suite_control_script():
