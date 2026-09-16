@@ -225,9 +225,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir published && cd published
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          # Resolve the real DMG asset name from the release (its name comes
+          # from the app version, which may differ from the tag — globbing an
+          # empty dir just 404s on a literal '*').
+          DMG=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" "$API/releases/tags/${TAG}" \
+            | python3 -c "import json,sys; a=[x['name'] for x in json.load(sys.stdin)['assets'] if x['name'].endswith('.dmg')]; print(a[0])")
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-          for f in Daisy.Cluster_*_aarch64.dmg Daisy.Cluster.app.tar.gz \
-                   Daisy.Cluster.app.tar.gz.sig latest.json SHA256SUMS.txt; do
+          for f in "$DMG" Daisy.Cluster.app.tar.gz Daisy.Cluster.app.tar.gz.sig \
+                   latest.json SHA256SUMS.txt; do
+            echo "→ $f"
             curl -sSL -f -H "Authorization: Bearer ${GH_TOKEN}" -O "$BASE/$f"
           done
           ls -la
