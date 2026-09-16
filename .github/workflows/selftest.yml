@@ -208,10 +208,13 @@ jobs:
           grep -q "telemetry emit loop live" "$APP/Contents/MacOS/daisy-cluster"
           echo "✔ payload verified: modules staged, wiring present, proof line in binary"
 
-      - name: Upload DMG artifact
+      - name: Upload DMG + updater artifacts
         uses: actions/upload-artifact@v4
         with:
           name: daisy-cluster-dmg
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
           if-no-files-found: ignore
           retention-days: 7
