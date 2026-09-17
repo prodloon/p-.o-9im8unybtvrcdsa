@@ -107,6 +107,19 @@ def suite_backend_battery():
           "confidence-score dynamic escalation" in out)
 
 
+def suite_skill_executor():
+    print("== SUITE 2c: SKILL EXECUTOR (SNIPE plans + executes, not just consumes) ==")
+    code, out, _err = run_node("backend/skill-executor.selftest.js")
+    check("executor", "skill-executor suite exits 0", code == 0)
+    check("executor", "32/32 checks pass", "32 passed, 0 failed" in out)
+    check("executor", "tier-1 scaffold lands real project files",
+          "real project scaffolded in the sandbox" in out)
+    check("executor", "plan jail rejects traversal/deletes/oversize",
+          "delete_file not allowed" in out and ".. traversal rejected" in out)
+    check("executor", "end-to-end orchestrator cycle produces artifacts",
+          "end-to-end — orchestrator cycle lands real project files" in out)
+
+
 def suite_stale_telemetry_guard():
     print("== SUITE 2b: STALE-TELEMETRY GUARD (hung tier-2 survival) ==")
     code, out, _err = run_node("backend/stale-telemetry.selftest.js")
@@ -452,6 +465,7 @@ def main():
     suite_governor_battery()
     suite_backend_battery()
     suite_stale_telemetry_guard()
+    suite_skill_executor()
     suite_live_pipeline()
     suite_telemetry()
     suite_shell_artifacts()

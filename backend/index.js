@@ -32,6 +32,7 @@ const { SupervisorBridge } = require('./supervisor-bridge');
 const { parseSupervisorLog } = require('./supervisor-log-parser');
 const { resolveSupervisorRoot } = require('./supervisor-root');
 const { SkillInjector } = require('./skill-injector');
+const { SkillExecutor } = require('./skill-executor');
 const { KeyHealthMonitor } = require('./key-health');
 const { T2Canary } = require('./t2-canary');
 
@@ -70,6 +71,14 @@ class Orchestrator {
       targetSize: opts.targetSize || 8,
       clock: this.governor.clock,
       hostStatsReader: () => readProcessStats(process.pid),
+    });
+    // Skill executor: SNIPE tasks plan + execute their skill, not just consume
+    // it. Shares the bridge's tier-2 config (same pinned model, timeout, and
+    // residency knob as consults); null tier-2 → tier-1 builders only.
+    this.pool.executor = new SkillExecutor({
+      tier2: this.bridge && this.bridge.tier2 ? { url: this.bridge.tier2.url, model: this.bridge.tier2.model, keepAlive: this.bridge.tier2.keepAlive } : null,
+      fetchImpl: this.bridge && this.bridge.fetchImpl ? (...a) => this.bridge.fetchImpl(...a) : undefined,
+      timeoutMs: (this.bridge && this.bridge.tier2 && this.bridge.tier2.timeoutMs) || undefined,
     });
     this.injector = new SkillInjector({
       skillbaseDir: opts.skillbaseDir || path.join(this.root, 'skillbase'),

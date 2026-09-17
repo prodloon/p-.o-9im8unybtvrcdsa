@@ -14,6 +14,7 @@
  */
 
 const { Worker } = require('./worker');
+const { SkillExecutor } = require('./skill-executor');
 
 class WorkerPool {
   /**
@@ -36,6 +37,9 @@ class WorkerPool {
     this.hostStatsReader = hostStatsReader || (() => ({ cpuPct: null, rssBytes: null }));
     this._lastStatsAt = 0;
     this._lastHostStats = { cpuPct: null, rssBytes: null };
+    // Skill executor: one per pool, shared by every worker's SNIPE action.
+    // tier2 === null → tier-1 builders only (no Ollama planning).
+    this.executor = new SkillExecutor({ tier2: null });
   }
 
   _nextId(kind) {
@@ -52,6 +56,7 @@ class WorkerPool {
     }
     const id = this._nextId(kind);
     const worker = new Worker({ id, kind, governor: this.governor, root: this.root });
+    worker.executor = this.executor;
     this.workers.set(id, worker);
     this.governor.registerWorker(id, kind, { priority });
     return worker;
@@ -188,6 +193,7 @@ class WorkerPool {
     const { state } = this.governor.wake(id);
     const info = this.governor.db.prepare('SELECT kind FROM workers WHERE id = ?').get(id);
     const w = new Worker({ id, kind: info ? info.kind : 'generic', governor: this.governor, root: this.root });
+    w.executor = this.executor;
     w.state = { ...w.state, ...state };
     this.workers.set(id, w);
     return w;

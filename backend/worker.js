@@ -72,6 +72,9 @@ class Worker {
     this.id = id;
     this.kind = kind;
     this.governor = governor;
+    this.executor = null;      // set by the pool/orchestrator (skill executor)
+    this._consumeOnly = false; // per-task: payload.consumeOnly skips execution
+    this._currentPayload = null;
     // Per-agent usage accounting (surfaced in the telemetry dashboard):
     this.busyMs = 0;        // cumulative wall time inside step() — owned signal
     this._stepStartedAt = null;
@@ -192,18 +195,33 @@ class Worker {
   }
 
   /**
-   * SNIPE: consume the injected skill. This action is only legal AFTER the
-   * orchestrator has run skill-sniping for this task — that's the gate.
+   * SNIPE: consume the injected skill AND EXECUTE it (Round 9 skill
+   * executor). Only legal AFTER the orchestrator has run skill-sniping for
+   * this task — that's the gate. Execution plans file ops from the skill
+   * (tier-1 builder, else tier-2 planner) and runs them through this
+   * worker's sandbox-jailed actions. Tasks that only need the skill
+   * consulted (no artifacts) can opt out with payload.consumeOnly: true.
    */
-  act_SNIPE() {
+  async act_SNIPE() {
     if (!this.state.injectedSkill) {
       throw new Error('SNIPE refused: no skill injected by orchestrator yet');
     }
-    return {
-      appliedSkill: this.state.injectedSkill,
-      source: this.state.skillSource,
-      note: 'skill context consumed into worker state',
-    };
+    if (this._consumeOnly) {
+      return {
+        appliedSkill: this.state.injectedSkill,
+        source: this.state.skillSource,
+        note: 'skill context consumed into worker state (consumeOnly)',
+      };
+    }
+    if (!this.executor) {
+      // Executor not wired (legacy embedders/tests) — preserve old semantics.
+      return {
+        appliedSkill: this.state.injectedSkill,
+        source: this.state.skillSource,
+        note: 'skill context consumed into worker state (no executor wired)',
+      };
+    }
+    return this.executor.execute(this, { payload: this._currentPayload || {}, kind: this.kind, id: 'current' });
   }
 
   // --- state machine ----------------------------------------------------------
@@ -220,6 +238,8 @@ class Worker {
     this.state.skillSource = null;
     this.state.skillContent = null;
     this.state.lastError = null;
+    this._consumeOnly = false;
+    this._currentPayload = null;
     this.state.phase = 'claimed';
   }
 
@@ -245,6 +265,8 @@ class Worker {
     this.governor.heartbeat(this.id);
 
     const { action, params = {} } = task.payload || {};
+    this._consumeOnly = task.payload && task.payload.consumeOnly === true;
+    this._currentPayload = task.payload || {};
     if (task.payload && task.payload.needsSkill && !this.state.injectedSkill) {
       // Gate: cognitive task may not act until the Supervisor (or fallback)
       // has had its say — applies to SNIPE itself and any other action.
