@@ -13,5 +13,15 @@
     "name": "api-route-map",
     "file": "api-route-map.md",
     "triggers": ["route", "routes", "map", "inventory", "audit"]
+  },
+  {
+    "name": "write-text",
+    "file": "write-text.md",
+    "triggers": ["write", "haiku", "poem", "note", "notes", "draft", "list", "letter", "plan", "compose", "text"]
+  },
+  {
+    "name": "code-explain",
+    "file": "code-explain.md",
+    "triggers": ["explain", "understand", "describe", "summarize", "document", "how does", "what does"]
   }
 ]
