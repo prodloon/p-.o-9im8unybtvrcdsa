@@ -125,9 +125,14 @@ spawn() { # spawn <name> <pidfile> <logfile> <cmd...>
 import os, subprocess, sys
 log, cmd = sys.argv[1], sys.argv[2:]
 out = open(log, "ab", buffering=0)
+env = dict(os.environ)
+# Bounded tier-2 consult so a cold/loaded CPU-only Ollama can never wedge
+# the orchestrator serve loop past the lease window (stale-telemetry bug).
+env.setdefault("DAISY_OLLAMA_TIMEOUT_MS", "30000")
 p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, start_new_session=True,
-                     cwd=os.path.dirname(os.path.abspath(log)) + "/..")
+                     cwd=os.path.dirname(os.path.abspath(log)) + "/..",
+                     env=env)
 print(p.pid)
 ' "$logfile" "$@")
   if [ -z "$pid" ]; then

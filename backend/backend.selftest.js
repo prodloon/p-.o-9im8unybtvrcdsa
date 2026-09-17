@@ -342,7 +342,9 @@ async function main() {
     try {
       const inj = new SkillInjector({ skillbaseDir: SKILL_DIR, governor: env.governor });
       const names = inj.listSkillNames();
-      check('catalog loads with 3 seed skills', names.length === 3 && names.includes('scaffold-express-api'));
+      // Catalog grew to 5 when write-text and code-explain landed (the
+      // stale-telemetry round); assert the seed skill + at least 5 total.
+      check('catalog loads with seed skills (5+ incl. scaffold-express-api)', names.length >= 5 && names.includes('scaffold-express-api'));
 
       const skill = inj.readSkill('file-bulk-rename');
       check('skill content readable', skill && /Bulk Rename/.test(skill.content));

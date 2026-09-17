@@ -321,6 +321,7 @@ write_agent_plist() {
   <dict>
     <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>DAISY_WARM_TIER2</key><string>${WARM_TIER2}</string>
+    <key>DAISY_OLLAMA_TIMEOUT_MS</key><string>30000</string>
   </dict>
   <key>StandardOutPath</key><string>${ROOT}/logs/launchd-agent.log</string>
   <key>StandardErrorPath</key><string>${ROOT}/logs/launchd-agent.log</string>

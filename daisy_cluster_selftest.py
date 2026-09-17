@@ -98,13 +98,26 @@ def suite_backend_battery():
     print("== SUITE 2: BACKEND BATTERY (node) ==")
     code, out, _err = run_node("backend/backend.selftest.js")
     check("backend", "battery exits 0", code == 0)
-    check("backend", "192/192 checks pass", "192 passed, 0 failed" in out)
+    check("backend", "192/192 checks pass", "192 passed, 0 failed" in out)  # count unchanged; seed-skill assertion broadened
     check("backend", "covers SNIPE gate",
           any("SNIPE" in line for line in out.splitlines()))
     check("backend", "covers permanent model mappings",
           "permanent mappings enforced" in out and "rejected (permanent pin)" in out)
     check("backend", "covers confidence-score escalation",
           "confidence-score dynamic escalation" in out)
+
+
+def suite_stale_telemetry_guard():
+    print("== SUITE 2b: STALE-TELEMETRY GUARD (hung tier-2 survival) ==")
+    code, out, _err = run_node("backend/stale-telemetry.selftest.js")
+    check("backend", "stale-telemetry suite exits 0", code == 0)
+    check("backend", "tier-2 timeout defaults to 30s", "tier-2 timeout defaults to 30s" in out)
+    check("backend", "launchers export the 30s timeout",
+          "clusterctl spawn exports" in out and "LaunchAgent plist exports" in out)
+    check("backend", "tick survives a hung consult",
+          "5 cycles completed while a consult hangs forever" in out)
+    check("backend", "telemetry written despite the hang",
+          "telemetry written every cycle despite the hang" in out)
 
 
 def suite_live_pipeline():
@@ -438,6 +451,7 @@ def main():
     print("=" * 60)
     suite_governor_battery()
     suite_backend_battery()
+    suite_stale_telemetry_guard()
     suite_live_pipeline()
     suite_telemetry()
     suite_shell_artifacts()

@@ -34,7 +34,12 @@ const POLICY = {
   // Tier 2: local Ollama triage — free, offline
   TIER2_OLLAMA_MODEL: 'qwen2.5:7b', // PINNED — no env override
   OLLAMA_URL: 'http://localhost:11434/api/chat', // PINNED — no env override
-  OLLAMA_TIMEOUT_MS: Number(process.env.DAISY_OLLAMA_TIMEOUT_MS) || 120_000, // generous: covers cold start
+  // 30s default (was 120s "generous"): a cold/loaded CPU-only Ollama can
+  // take 2m+ per consult, which wedged the orchestrator's serve loop past
+  // the lease window — telemetry froze, the dashboard showed "stale". 30s
+  // aborts a stuck consult cleanly, falls through to local sniping, and
+  // keeps the loop cycling. Override with DAISY_OLLAMA_TIMEOUT_MS.
+  OLLAMA_TIMEOUT_MS: Number(process.env.DAISY_OLLAMA_TIMEOUT_MS) || 30_000,
   // Residency policy: pin qwen weights in RAM so tier-2 consults skip the
   // 4-5 GB cold load (~20s+ on this box). -1 (JSON number) = resident
   // forever. GOTCHA (Ollama 0.33.3): keep_alive is parsed as a Go duration
