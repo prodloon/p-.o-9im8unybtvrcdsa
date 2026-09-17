@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { subscribeTelemetry, subscribeShellAlert, subscribeUpdateAvailable, subscribeUpdateReady, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
+import { subscribeTelemetry, subscribeShellAlert, subscribeUpdateAvailable, subscribeUpdateReady, enqueueTask, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
 
 const MAX_HISTORY = 60; // ~60s of samples at 1Hz
 
@@ -191,6 +191,68 @@ const AgentTable = React.memo(function AgentTable({ workers, hostStats, perWorke
 });
 
 /** 3-Tier cascade pipeline: per-cycle tier distribution + model pins + last route + cost rollup. */
+/** Task submission panel: enqueues work into the orchestrator's queue via
+ *  the telemetry server's POST /api/enqueue (loopback). AI tasks go through
+ *  the skill cascade; file-io tasks write inside the sandbox root. */
+function TaskForm() {
+  const [kind, setKind] = useState('scaffold');
+  const [summary, setSummary] = useState('');
+  const [path, setPath] = useState('');
+  const [content, setContent] = useState('');
+  const [status, setStatus] = useState(null); // {ok, text}
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setStatus(null);
+    try {
+      const payload = kind === 'file-io'
+        ? { action: 'write_file', params: { path: path.trim(), content } }
+        : { action: 'SNIPE', needsSkill: true, summary: summary.trim() };
+      const r = await enqueueTask(kind, payload);
+      setStatus({ ok: true, text: `task #${r.id} enqueued (${r.kind})` });
+      setSummary('');
+      setContent('');
+    } catch (err) {
+      setStatus({ ok: false, text: err.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4">
+      <div className="mb-2 text-xs font-medium uppercase tracking-wider text-slate-400">Give the cluster a task</div>
+      <div className="flex gap-2">
+        <select value={kind} onChange={(e) => setKind(e.target.value)} className="rounded bg-slate-900 px-2 py-1.5 text-sm text-slate-200 border border-slate-600/60">
+          <option value="scaffold">AI task (skill cascade)</option>
+          <option value="file-io">File write (sandboxed)</option>
+        </select>
+        <button type="submit" disabled={busy}
+          className="ml-auto rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-40">
+          {busy ? 'enqueueing…' : 'Enqueue'}
+        </button>
+      </div>
+      {kind === 'scaffold' ? (
+        <textarea value={summary} onChange={(e) => setSummary(e.target.value)} rows={2}
+          placeholder="what should it build? e.g. scaffold an express api for invoices"
+          className="mt-2 w-full rounded bg-slate-900 px-2 py-1.5 text-sm text-slate-200 border border-slate-600/60 placeholder-slate-600" />
+      ) : (
+        <div className="mt-2 space-y-2">
+          <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="sandbox path, e.g. notes/idea.txt"
+            className="w-full rounded bg-slate-900 px-2 py-1.5 text-sm text-slate-200 border border-slate-600/60 placeholder-slate-600" />
+          <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={2} placeholder="file contents"
+            className="w-full rounded bg-slate-900 px-2 py-1.5 text-sm text-slate-200 border border-slate-600/60 placeholder-slate-600" />
+        </div>
+      )}
+      {status && (
+        <div className={`mt-2 text-xs ${status.ok ? 'text-emerald-400' : 'text-rose-400'}`}>{status.text}</div>
+      )}
+    </form>
+  );
+}
+
 function CascadePanel({ cascade, costs, proj = null }) {
   const tiers = cascade?.tiers || {};
   const last = cascade?.lastTier;
@@ -506,7 +568,12 @@ export default function App() {
       </div>
 
       <div className="mt-4">
-        <AgentTable workers={pool.workers} hostStats={sample?.hostStats} perWorkerRss={sample?.hostStats?.perWorkerRss} />
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <TaskForm />
+          <div className="lg:col-span-2">
+            <AgentTable workers={pool.workers} hostStats={sample?.hostStats} perWorkerRss={sample?.hostStats?.perWorkerRss} />
+          </div>
+        </div>
       </div>
     </div>
   );

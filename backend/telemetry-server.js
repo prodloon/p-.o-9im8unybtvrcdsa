@@ -18,6 +18,30 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { Governor } = require('../governor/governor');
+
+// ---- Task enqueue (dashboard submit path) ----------------------------------
+// Lazily-constructed Governor sharing the orchestrator's task_queue DB.
+// Access is INSERT-only (enqueueTask), so WAL concurrency with the
+// orchestrator is safe.
+const TASK_KINDS = new Set(['file-io', 'scaffold', 'generic']);
+const governor = new Governor({ silent: true });
+
+function readJsonBody(req, cb) {
+  let body = '';
+  req.on('data', (c) => {
+    body += c;
+    if (body.length > 64 * 1024) req.destroy(); // size cap
+  });
+  req.on('end', () => {
+    try {
+      cb(null, JSON.parse(body || '{}'));
+    } catch (e) {
+      cb(e);
+    }
+  });
+  req.on('error', (e) => cb(e));
+}
 
 // Same override as the orchestrator — installed-app mode redirects data dir.
 const TELEMETRY_FILE = path.join(
@@ -42,16 +66,53 @@ const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json');
   // The payload is a live gauge — browsers must never heuristic-cache it.
   res.setHeader('Cache-Control', 'no-store');
+  // CORS preflight for the POST endpoint (Vite dev origin)
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/enqueue') {
+    readJsonBody(req, (err, body) => {
+      if (err) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: 'invalid JSON body' }));
+        return;
+      }
+      const kind = typeof body.kind === 'string' ? body.kind : 'generic';
+      if (!TASK_KINDS.has(kind)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: `kind must be one of: ${[...TASK_KINDS].join(', ')}` }));
+        return;
+      }
+      const payload = body.payload && typeof body.payload === 'object' ? body.payload : {};
+      // Guardrail: a summary is required for AI work — an empty SNIPE task
+      // would just burn a tier-2 inference for nothing.
+      if (payload.needsSkill && !String(payload.summary || '').trim()) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: 'payload.summary is required when needsSkill is true' }));
+        return;
+      }
+      const id = governor.enqueueTask(kind, payload);
+      console.log(`[telemetry] enqueued task ${id} (kind=${kind}) via dashboard`);
+      res.end(JSON.stringify({ ok: true, id, kind }));
+    });
+    return;
+  }
+
   if (req.method !== 'GET' || !req.url.startsWith('/api/telemetry')) {
     res.statusCode = 405;
-    res.end(JSON.stringify({ error: 'GET /api/telemetry only' }));
+    res.end(JSON.stringify({ error: 'GET /api/telemetry or POST /api/enqueue only' }));
     return;
   }
   res.end(JSON.stringify(readTelemetry()));
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`[telemetry] http://127.0.0.1:${PORT}/api/telemetry (loopback only)`);
+  console.log(`[telemetry] http://127.0.0.1:${PORT}/api/telemetry + POST /api/enqueue (loopback only)`);
 });
 
 // --- outage watcher: ping when the orchestrator snapshot freezes ------------

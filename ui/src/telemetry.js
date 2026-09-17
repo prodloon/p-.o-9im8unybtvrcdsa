@@ -47,6 +47,21 @@ export async function subscribeTelemetry(onSample) {
   };
 }
 
+/** Submit a task to the orchestrator via the telemetry server's enqueue
+ *  endpoint (loopback only). Works in both browser and Tauri modes since
+ *  both reach the same 127.0.0.1:6292 listener. Resolves to {ok, id, kind}
+ *  or throws with the server's error message. */
+export async function enqueueTask(kind, payload) {
+  const res = await fetch('http://127.0.0.1:6292/api/enqueue', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind, payload }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `enqueue failed (${res.status})`);
+  return data;
+}
+
 /** Shell alert channel: the Rust host emits `shell://no-node` when no Node
  *  runtime was found at launch (backend can never spawn). Returns unlisten,
  *  or null in plain-browser mode where the concept doesn't apply. */
