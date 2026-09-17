@@ -111,7 +111,9 @@ def suite_skill_executor():
     print("== SUITE 2c: SKILL EXECUTOR (SNIPE plans + executes, not just consumes) ==")
     code, out, _err = run_node("backend/skill-executor.selftest.js")
     check("executor", "skill-executor suite exits 0", code == 0)
-    check("executor", "32/32 checks pass", "32 passed, 0 failed" in out)
+    check("executor", "45/45 checks pass", "45 passed, 0 failed" in out)
+    check("executor", "freeform AGENT turns work with no trigger words",
+          "freeform AGENT — chat without trigger words" in out)
     check("executor", "tier-1 scaffold lands real project files",
           "real project scaffolded in the sandbox" in out)
     check("executor", "plan jail rejects traversal/deletes/oversize",
@@ -245,10 +247,22 @@ def suite_telemetry():
     # HTTP fallback transport on a private port
     srv = subprocess.Popen([NODE, "backend/telemetry-server.js", "--port", "6399"],
                            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # A cold first launch (native-module load, fs-extra cache) can exceed a
+    # flat 0.8s — retry the probe instead of flaking.
+    data = None
+    err = None
     try:
-        time.sleep(0.8)
-        data = http_json("http://127.0.0.1:6399/api/telemetry")
-        check("telemetry", "HTTP transport serves JSON", isinstance(data, dict))
+        for _ in range(10):
+            time.sleep(0.8)
+            try:
+                data = http_json("http://127.0.0.1:6399/api/telemetry")
+                break
+            except Exception as probe_exc:  # noqa: BLE001
+                err = str(probe_exc)
+                if srv.poll() is not None:
+                    break  # server died — report failure below, not retry noise
+        check("telemetry", "HTTP transport serves JSON", isinstance(data, dict),
+              "" if isinstance(data, dict) else (err or "server not reachable after retries"))
     except Exception as exc:  # noqa: BLE001
         check("telemetry", "HTTP transport serves JSON", False, str(exc))
     finally:

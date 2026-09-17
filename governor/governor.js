@@ -341,13 +341,20 @@ class Governor {
     return stale.map((r) => r.id);
   }
 
-  /** Requeue tasks whose lease expired (worker died mid-task). */
-  reapExpiredLeases() {
+  /** Requeue tasks whose lease expired (worker died mid-task).
+   * AGENT exception: an active freeform agent turn renews its own lease at
+   * each round start; the orchestrator registers the turn in _agentTurns and
+   * clears the entry when the task leaves the reaper window. A requeue here
+   * while a live turn is registered would double-run the turn, so those ids
+   * are skipped (isAgentTurnFn is injected by the orchestrator).
+   */
+  reapExpiredLeases(isAgentTurnFn = null) {
     const now = this.clock();
     const expired = this.db
       .prepare("SELECT id, leased_by FROM task_queue WHERE status='leased' AND lease_expires < ?")
       .all(now - LEASE_GRACE_MS);
     for (const t of expired) {
+      if (typeof isAgentTurnFn === 'function' && isAgentTurnFn(t.id)) continue; // live agent turn — never reap
       this.db
         .prepare(
           "UPDATE task_queue SET status='pending', leased_by=NULL, lease_expires=NULL, attempts=attempts+1 WHERE id = ?"
@@ -453,7 +460,7 @@ class Governor {
     }
 
     this.reapStaleWorkers();
-    this.reapExpiredLeases();
+    this.reapExpiredLeases(this._isAgentTurnFn || null); // agent turns renew their own leases — never reap those
     return actions;
   }
 

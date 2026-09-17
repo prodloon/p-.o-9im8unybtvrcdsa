@@ -27,6 +27,7 @@
  */
 
 const { execFileSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 const POLICY = {
@@ -35,6 +36,34 @@ const POLICY = {
   MAX_TOTAL_BYTES: 1_000_000, // whole-plan cap (1 MB)
   TIER2_PLAN_TIMEOUT_MS: Number(process.env.DAISY_OLLAMA_TIMEOUT_MS) || 30_000, // same knob as consults
   TIER2_PLAN_MAX_TOKENS: 800, // plans are bigger than consult verdicts
+  // --- Freeform AGENT planning (own budget, own model) ---------------------
+  // Model bake-off (2026-09-17, this CPU-only Mac, live planning probes):
+  //   qwen2.5:1.5b — fast (~11s) but HALLUCINATES: replies "created X" with
+  //     zero ops on every retry → useless as an agent brain.
+  //   llama3.2:3b — reliably plans correct ops, ~40s warm. PINNED default.
+  //   qwen2.5:3b — plans but wrong op shape; 2-4min for coder/12b models.
+  // The AGENT path therefore does NOT share the consult model. Override:
+  // DAISY_AGENT_MODEL (set '0' to disable the agent brain entirely).
+  AGENT_MODEL: process.env.DAISY_AGENT_MODEL || 'llama3.2:3b',
+  AGENT_PLAN_TIMEOUT_MS: Number(process.env.DAISY_AGENT_TIMEOUT_MS) || 240_000, // cold-load + thinking
+  AGENT_PLAN_MAX_TOKENS: 1200,
+  AGENT_KEEP_ALIVE: -1, // pin the model so warm replies stay ~40s not ~2min // plans are bigger than consult verdicts
+  // --- ReAct loop (Round 10: reason → act → observe, until done) -----------
+  // The brain no longer plans everything in one shot: each round it may
+  // call a tool (list/read/write/…), see the REAL observation, and reason
+  // again — until it answers with done:true. Hard step budget + byte
+  // budget; every tool call goes through the worker's sandbox-jailed actions.
+  AGENT_MAX_STEPS: Number(process.env.DAISY_AGENT_MAX_STEPS) || 8, // hard loop budget
+  // Lease window for one agent round. MUST exceed the model round time
+  // (AGENT_PLAN_TIMEOUT_MS) + tool time + margin: the lease is renewed at
+  // the START of each round to cover the whole round — a 240s inference
+  // with a 55s lease would get the task reaped mid-thinking.
+  AGENT_LEASE_MS: 300_000,
+  AGENT_OBSERVATION_CAP: 2000,  // chars of tool output fed back per round
+  AGENT_READ_CAP: 12_000,       // read_file tool refuses bigger files (observation hygiene)
+  AGENT_BUDGET: {
+    maxBytes: Number(process.env.DAISY_AGENT_BUDGET_BYTES) || 600_000, // total bytes written per turn
+  },
 };
 
 // Only content-producing actions are legal in a plan. delete_file is
@@ -163,6 +192,217 @@ async function askTier2Plan(skill, task, summary, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Freeform agent planner (AGENT action) — no skill required.
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize one model-authored op to the executor's {action, path, content}
+ * shape. Small models emit variants: op/file/field instead of action/path.
+ * Returns null for unrecognizable ops (dropped before validation).
+ */
+function normalizeOp(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const action = raw.action || raw.op || raw.type;
+  const p = raw.path || raw.file || raw.target || raw.filename;
+  const op = { action, path: p, content: raw.content };
+  if (typeof op.action !== 'string' || typeof op.path !== 'string') return null;
+  op.action = op.action.toLowerCase();
+  if (op.action === 'write' || op.action === 'create') op.action = 'write_file';
+  if (op.action === 'append') op.action = 'append_file';
+  if (typeof op.content !== 'string') op.content = op.content == null ? '' : String(op.content);
+  return op;
+}
+
+const AGENT_SYSTEM_PROMPT = [
+  'You are the agent brain of the Daisy Chain cluster, running a Reason+Act loop against a sandboxed file worker.',
+  'The sandbox may already contain a project — you start with the file inventory; call the read_file tool for contents before modifying anything.',
+  'Each round you return ONE JSON object, no prose, and you will see the REAL result of your action before the next round:',
+  '  call a tool: {"thought":"short reasoning","tool":"list_files","args":{"dir":"src"}}',
+  '  write files: {"thought":"...","ops":[{"action":"write_file","path":"src/x.js","content":"..."}]}',
+  '  finish:      {"thought":"...","done":true,"reply":"what you did for the user, 1-3 sentences"}',
+  'Tools: list_files(dir?), read_file(path), file_stats(path), write_file(path,content), append_file(path,content), mkdir(path), http_get_json(url).',
+  'Ops actions allowed: write_file, append_file, mkdir. Paths relative (no .., no leading /). Never delete files. Full file contents, never diffs.',
+  'You have a limited step budget — do not waste rounds; work independently and never ask the user questions mid-task.',
+  'HARD RULE: never claim a file exists unless you wrote it in THIS conversation. A pure question gets done:true and the answer, immediately.',
+].join(' ');
+
+const AGENT_TOOLS = ['list_files', 'read_file', 'file_stats', 'write_file', 'append_file', 'mkdir', 'http_get_json'];
+
+function _clip(v, cap) {
+  const s = typeof v === 'string' ? v : JSON.stringify(v);
+  return s && s.length > cap ? s.slice(0, cap) + `…[clipped, ${s.length} chars]` : s;
+}
+
+/**
+ * One Ollama JSON request with the given transcript → parsed object.
+ * Returns null on any failure (offline, timeout, non-JSON, unparseable).
+ */
+async function callOllamaJson(opts, messages) {
+  const agent = opts.agent;
+  const fetchImpl = opts.fetchImpl || ((...a) => globalThis.fetch(...a));
+  try {
+    const res = await fetchImpl(agent.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: agent.model,
+        messages,
+        stream: false,
+        format: 'json',
+        keep_alive: agent.keepAlive,
+        options: { temperature: 0.2, num_predict: agent.maxTokens || POLICY.AGENT_PLAN_MAX_TOKENS },
+      }),
+      signal: AbortSignal.timeout(agent.timeoutMs || POLICY.AGENT_PLAN_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const content = (body && body.message && body.message.content) || '';
+    const match = content.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Execute one tool call inside the sandbox jail. Returns {ok, result} and
+ * NEVER throws — errors become observations the brain can reason about
+ * (that is the O in ReAct: a failed read teaches the model the file is absent).
+ */
+async function runTool(worker, name, args) {
+  try {
+    if (!AGENT_TOOLS.includes(name)) throw new Error(`unknown tool '${name}' (have: ${AGENT_TOOLS.join(', ')})`);
+    if (!args || typeof args !== 'object') throw new Error('args must be an object');
+    const p = typeof args.path === 'string' ? args.path : '';
+    if ((name === 'read_file' || name === 'file_stats') && p) {
+      const st = fs.statSync(path.join(worker.root, p));
+      if (st.size > POLICY.AGENT_READ_CAP) {
+        return { ok: true, result: `[skipped: ${p} is ${st.size} bytes, over the ${POLICY.AGENT_READ_CAP}-byte read cap]` };
+      }
+    }
+    const fn = worker[`act_${name}`];
+    if (!fn) throw new Error(`tool '${name}' unavailable`);
+    const out = fn.call(worker, args);
+    return { ok: true, result: out && typeof out.then === 'function' ? await out : out };
+  } catch (e) {
+    return { ok: false, result: e && e.message ? e.message : String(e) };
+  }
+}
+
+/**
+ * The ReAct loop — the agentic flow proper.
+ * Round: brain answers {thought, tool, args} → runTool → observation appended
+ * to the transcript → next round. When the brain answers with ops, they are
+ * executed through the sandbox-jailed actions. When it answers with
+ * done:true + reply, the turn ends. Single-round {ops, reply} answers (the
+ * Round-9 format) remain valid: they finish immediately.
+ *
+ * Safety: hard step budget (AGENT_MAX_STEPS), per-op + total byte budgets,
+ * sandbox jail on every tool/op, and a lease-renewal hook so long turns are
+ * not reaped mid-flight (the loop abandons itself if the lease is lost).
+ */
+async function runAgentLoop(worker, task, summary, existingFiles, opts = {}) {
+  const agent = opts.agent;
+  if (!agent) throw new Error('agent brain not configured (no AGENT model)');
+  const fetchImpl = opts.fetchImpl || ((...a) => globalThis.fetch(...a));
+  const leaseMs = agent.leaseMs || POLICY.AGENT_LEASE_MS;
+  const maxSteps = agent.maxSteps || POLICY.AGENT_MAX_STEPS;
+  const renew = typeof opts.renewLease === 'function' ? opts.renewLease : null;
+  const onRound = typeof opts.onRound === 'function' ? opts.onRound : null;
+  const reportRound = (info) => { if (onRound) { try { onRound(info); } catch { /* progress is best-effort */ } } };
+
+  const messages = [
+    { role: 'system', content: AGENT_SYSTEM_PROMPT },
+    { role: 'user', content: JSON.stringify({ request: String(summary || ''), existing_files: existingFiles || [] }) },
+  ];
+  const ops = [];
+  const toolCalls = [];
+  let bytesWritten = 0;
+  let reply = '';
+  let steps = 0;
+  let staleAt = Date.now() + leaseMs;
+  reportRound({ round: 0, tool: null, ops: 0 });
+
+  while (steps < maxSteps) {
+    steps += 1;
+    // Renew the lease to cover THIS round (model call + tool). The renewal
+    // itself is the liveness check: it throws if the task's lease was lost
+    // (worker died / reaper raced), aborting the turn promptly.
+    staleAt = Date.now() + leaseMs;
+    if (renew) {
+      try {
+        renew(staleAt, { round: steps });
+      } catch (e) {
+        // Lease lost — the reaper requeued this task; continuing would work
+        // under a stale identity. Abandon the turn promptly.
+        throw new Error(`agent turn aborted: lease lost after round ${steps} (${e.message})`);
+      }
+    }
+
+    const parsed = await callOllamaJson(opts, messages);
+    if (!parsed || typeof parsed !== 'object') {
+      // Same honest-failure contract as before the loop existed: model down,
+      // timed out, or returned garbage → the task fails, it never fakes done.
+      throw new Error('agent planner unavailable (model down or timed out) — task failed honestly, retry');
+ }
+    const thought = typeof parsed.thought === 'string' ? parsed.thought : '';
+
+    // --- ACT: model-authored file ops -------------------------------------
+    if (Array.isArray(parsed.ops) && parsed.ops.length) {
+      for (const raw of parsed.ops) {
+        const op = normalizeOp(raw);
+        if (!op) continue;
+        if (!PLAN_ACTIONS.has(op.action)) throw new Error(`round ${steps}: op action '${op.action}' not allowed`);
+        const size = Buffer.byteLength(String(op.content || ''), 'utf8');
+        if (size > POLICY.MAX_OP_BYTES) throw new Error(`round ${steps}: op content ${size}B exceeds per-op cap ${POLICY.MAX_OP_BYTES}`);
+        bytesWritten += size;
+        if (bytesWritten > POLICY.AGENT_BUDGET.maxBytes) throw new Error(`agent budget exceeded: ${bytesWritten}B written (cap ${POLICY.AGENT_BUDGET.maxBytes})`);
+        const fn = worker[`act_${op.action}`];
+        if (!fn) throw new Error(`round ${steps}: worker has no action '${op.action}'`);
+        const params = op.action === 'mkdir' ? { path: op.path } : { path: op.path, content: op.content };
+        try { fn.call(worker, params); } catch (e) { throw new Error(`round ${steps}: ${op.action} ${op.path} failed: ${e.message}`); }
+        ops.push({ action: op.action, path: op.path });
+      }
+      reportRound({ round: steps, tool: null, ops: ops.length });
+      // Single-round plan (Round-9 shape: ops + reply, no tool/done) or an
+      // explicit done after ops → finish now.
+      if (parsed.done === true || (!parsed.tool && typeof parsed.reply === 'string' && parsed.reply.trim())) {
+        reply = String(parsed.reply || '').trim();
+        break;
+      }
+      messages.push({ role: 'assistant', content: JSON.stringify({ thought, wrote: parsed.ops.length }) });
+      messages.push({ role: 'user', content: JSON.stringify({ observation: `${parsed.ops.length} op(s) written to the sandbox. Continue with the next tool call, or finish with {"done":true,"reply":"..."}.` }) });
+      continue;
+    }
+
+    // --- FINISH: pure answer / explicit done ------------------------------
+    if ((typeof parsed.reply === 'string' && parsed.reply.trim() && !parsed.tool) || parsed.done === true) {
+      reply = String(parsed.reply || '').trim();
+      break;
+    }
+
+    // --- REASON+ACT: call a tool, observe, loop ---------------------------
+    const tool = typeof parsed.tool === 'string' ? parsed.tool : null;
+    if (!tool) throw new Error(`agent brain round ${steps}: no tool, no ops, not done (thought: ${_clip(thought, 120) || 'none'})`);
+    const obs = await runTool(worker, tool, parsed.args);
+    toolCalls.push({ step: steps, tool, args: parsed.args, ok: obs.ok });
+    reportRound({ round: steps, tool, ops: ops.length });
+    if (tool === 'write_file' || tool === 'append_file') ops.push({ action: tool, path: (parsed.args && parsed.args.path) || '?' });
+    messages.push({ role: 'assistant', content: JSON.stringify({ thought, tool, args: parsed.args }) });
+    messages.push({ role: 'user', content: JSON.stringify({ observation: _clip(obs.result, POLICY.AGENT_OBSERVATION_CAP), ok: obs.ok }) });
+  }
+  if (!reply) throw new Error(`agent ran out of steps (${maxSteps}) without finishing`);
+  return {
+    ops,
+    reply,
+    note: `agent plan (react: ${agent.model}, ${steps} round(s), ${toolCalls.length} tool call(s))`,
+    rounds: steps,
+    toolCalls,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Validation + execution.
 // ---------------------------------------------------------------------------
 
@@ -242,8 +482,10 @@ class SkillExecutor {
    */
   constructor(opts = {}) {
     this.tier2 = opts.tier2 !== undefined ? opts.tier2 : null;
+    this.agent = opts.agent !== undefined ? opts.agent : null;
     this.fetchImpl = opts.fetchImpl;
     this.timeoutMs = opts.timeoutMs || POLICY.TIER2_PLAN_TIMEOUT_MS;
+    this.onRound = typeof opts.onRound === 'function' ? opts.onRound : null; // per-round progress hook (orchestrator registry)
   }
 
   /**
@@ -294,9 +536,89 @@ class SkillExecutor {
       acceptance,
     };
   }
+
+  /**
+   * Freeform agent turn: no skill, no triggers — the user just says what
+   * they want and the model plans ops against the existing sandbox (with
+   * existing file CONTENTS so it can read/modify the project). The user-
+   * facing reply comes back in `reply` for the chat UI.
+   */
+  async executeAgent(worker, task, opts = {}) {
+    if (!this.agent) throw new Error('agent brain not configured (no AGENT model)');
+    const summary = String((task.payload && (task.payload.summary || task.payload.action)) || task.kind);
+    // Hand the model the project: names + contents of text files under 20KB,
+    // names only for big/binary ones. This is what makes it work "on the
+    // project" — it sees the code before planning.
+    const existingFiles = [];
+    try {
+      const walk = (dir, prefix) => {
+        for (const name of worker.act_list_files({ dir }).files) {
+          if (name === 'node_modules' || name.startsWith('.')) continue;
+          const rel = prefix ? `${prefix}/${name}` : name;
+          const full = require('path').join(worker.root, rel);
+          let st = null;
+          try { st = fs.statSync(full); } catch { continue; }
+          if (st.isDirectory()) { walk(name, rel); continue; }
+          if (st.size <= 20_000 && st.isFile()) {
+            let content = '';
+            try { content = fs.readFileSync(full, 'utf8'); } catch { /* binary-ish */ }
+            existingFiles.push({ path: rel, content });
+          } else {
+            existingFiles.push({ path: rel, content: null }); // name only
+          }
+        }
+      };
+      walk('.', null);
+    } catch { /* fresh sandbox */ }
+    if (existingFiles.length > 120) existingFiles.length = 120; // context cap
+
+    const plan = await runAgentLoop(worker, task, summary, existingFiles, {
+      agent: this.agent,
+      fetchImpl: this.fetchImpl,
+      maxSteps: opts.maxSteps,
+      renewLease: typeof opts.renewLease === 'function' ? opts.renewLease : null,
+      onRound: (info) => {
+        // Fan the round info out: the caller's per-task hook (worker →
+        // progress file) and the executor-level hook (orchestrator → live
+        // registry), enriched with the task id so both can attribute it.
+        const enriched = { ...info, taskId: task.id };
+        if (typeof opts.onRound === 'function') { try { opts.onRound(enriched); } catch { /* best-effort */ } }
+        if (typeof this.onRound === 'function') { try { this.onRound(enriched); } catch { /* best-effort */ } }
+      },
+    });
+    if (!plan) throw new Error('agent planner unavailable (model down or timed out) — task failed honestly, retry');
+    // Unlike skill plans, an AGENT turn may legitimately have ZERO ops — a
+    // pure answer to a question is a complete turn. Only NON-empty plans
+    // are validated/executed.
+    const ops = plan.ops.length > 0 ? validateOps(plan.ops) : [];
+    // Anti-hallucination pass: a reply that CLAIMS file actions must be
+    // backed by real ops. Small local models routinely say "I created X"
+    // while emitting no op for X — rewrite the reply to say what actually
+    // happened, so the chat never shows a lie.
+    let reply = String(plan.reply || '').trim();
+    if (ops.length === 0 && /\b(created|wrote|writt?en|added|updated|modified|deleted)\b/i.test(reply)) {
+      reply = 'No changes were made. ' + reply.replace(/^\s*I\s+(have\s+)?/i, '');
+    }
+    const { executed, filesWritten } = executeOps(worker, ops);
+    worker.state.filesWritten.push(...filesWritten);
+    return {
+      appliedSkill: null,
+      source: 'agent',
+      planSource: 'agent-plan',
+      note: plan.note,
+      executed,
+      filesWritten,
+      acceptance: null,
+      reply,
+      ops: ops.map((o) => ({ action: o.action, path: o.path })),
+      rounds: plan.rounds || 1,
+      observations: plan.toolCalls || [],
+    };
+  }
 }
 
 module.exports = {
   SkillExecutor, validateOps, executeOps, runAcceptanceChecks,
-  hasTier1Builder, askTier2Plan, TIER1_BUILDERS, PLAN_ACTIONS, POLICY,
+  hasTier1Builder, askTier2Plan, runAgentLoop, runTool, callOllamaJson, AGENT_TOOLS,
+  TIER1_BUILDERS, PLAN_ACTIONS, POLICY,
 };

@@ -28,6 +28,7 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 const { Governor, POLICY: GOV_POLICY, readProcessStats } = require('../governor/governor');
 const { WorkerPool } = require('./worker-pool');
+const { POLICY: EXECUTOR_POLICY } = require('./skill-executor');
 const { SupervisorBridge } = require('./supervisor-bridge');
 const { parseSupervisorLog } = require('./supervisor-log-parser');
 const { resolveSupervisorRoot } = require('./supervisor-root');
@@ -79,7 +80,28 @@ class Orchestrator {
       tier2: this.bridge && this.bridge.tier2 ? { url: this.bridge.tier2.url, model: this.bridge.tier2.model, keepAlive: this.bridge.tier2.keepAlive } : null,
       fetchImpl: this.bridge && this.bridge.fetchImpl ? (...a) => this.bridge.fetchImpl(...a) : undefined,
       timeoutMs: (this.bridge && this.bridge.tier2 && this.bridge.tier2.timeoutMs) || undefined,
+      // Freeform AGENT brain: pinned fast planning model (NOT the 7b consult
+      // model — minutes-per-request on CPU-only hosts). Unset env → null →
+      // AGENT tasks fail honestly instead of wedging on a slow model.
+      agent: process.env.DAISY_AGENT_MODEL === '0' ? null : {
+        url: (this.bridge && this.bridge.tier2 && this.bridge.tier2.url) || 'http://localhost:11434/api/chat',
+        model: process.env.DAISY_AGENT_MODEL || 'llama3.2:3b',
+        keepAlive: -1,
+        timeoutMs: Number(process.env.DAISY_AGENT_TIMEOUT_MS) || 240_000,
+        maxTokens: 1200,
+      },
     });
+    // Per-round ReAct progress: the executor's hook updates the live-turn
+    // registry (telemetry + reaper guard) with what the brain is doing.
+    this.pool.executor.onRound = (info) => {
+      // info: {round, tool, ops, taskId} — emitted by executeAgent.
+      const turn = this._agentTurns.get(info.taskId);
+      if (turn) {
+        turn.rounds = info.round;
+        turn.tool = info.tool;
+        turn.ops = info.ops;
+      }
+    };
     this.injector = new SkillInjector({
       skillbaseDir: opts.skillbaseDir || path.join(this.root, 'skillbase'),
       governor: this.governor,
@@ -96,6 +118,12 @@ class Orchestrator {
     // 3-Tier cascade accounting (telemetry + dashboard pipeline panel)
     this._tiers = { 'tier1-template': 0, 'tier2-local': 0, supervisor: 0, 'local-fallback': 0 };
     this._lastTier = null;
+    this._lastAgentReply = null; // latest freeform agent turn (chat UI)
+    this._agentTurns = new Map(); // taskId → {startedAt, rounds, tool, ops, leaseStaleAt} — live ReAct turns
+    // The governor's lease reaper must not requeue tasks whose AGENT turn is
+    // running (the turn renews its own lease each round; the registry entry
+    // is removed when the turn finishes either way).
+    this.governor._isAgentTurnFn = (taskId) => this._agentTurns.has(taskId);
   }
 
   _catalog() {
@@ -205,6 +233,15 @@ class Orchestrator {
         continue;
       }
 
+      // Freeform AGENT turns run a multi-round ReAct loop and can outlive
+      // one lease window; register the turn so (a) the executor renews the
+      // lease each round and (b) the reaper knows this lease is ALIVE, not
+      // abandoned — it must never requeue a running agent turn.
+      const isAgentTurn = (task.payload && task.payload.action) === 'AGENT';
+      if (isAgentTurn) {
+        this._agentTurns.set(task.id, { startedAt: Date.now(), rounds: 0, tool: null, ops: 0, leaseStaleAt: Date.now() + EXECUTOR_POLICY.AGENT_LEASE_MS });
+      }
+
       let report = await worker.step(task);
 
       // --- SNIPE gate: cognitive task needs a skill before it may act ------
@@ -225,6 +262,20 @@ class Orchestrator {
 
       const ok = !!(report && report.ok);
       worker.state.phase = ok ? 'done' : 'failed'; // release back to the pool
+      if (isAgentTurn) this._agentTurns.delete(task.id); // turn finished (either way)
+      if (ok && report.result && report.result.reply) {
+        // Freeform AGENT turn: keep the model's user-facing reply for the
+        // chat UI (latest reply only — the conversation is one thread).
+        this._lastAgentReply = {
+          taskId: task.id,
+          reply: String(report.result.reply).slice(0, 2000),
+          ops: report.result.ops || [],
+          rounds: report.result.rounds || 1,
+          observations: report.result.observations || [],
+          at: Date.now(),
+        };
+        if (this.verbose) console.log(`[orch] agent turn ${task.id}: ${report.result.ops ? report.result.ops.length : 0} op(s), ${report.result.rounds || 1} round(s), reply ready`);
+      }
       if (ok) {
         this.governor.completeTask(task.id, true);
         stats.tasksDone += 1;
@@ -427,6 +478,12 @@ class Orchestrator {
       keyHealth: this.keyHealth.snapshot(),
       // Tier-2 residency canary (dashboard badge) — is qwen actually loaded?
       t2Health: this.t2Canary.snapshot(),
+      // Freeform agent chat: the latest turn's user-facing reply.
+      agentReply: this._lastAgentReply || null,
+      agentTurns: [...this._agentTurns.values()].map((t) => ({
+        ...t,
+        runningSec: Math.round((Date.now() - t.startedAt) / 1000),
+      })),
     };
   }
 

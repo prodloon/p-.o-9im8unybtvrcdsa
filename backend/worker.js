@@ -22,7 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const ACTIONS = ['list_files', 'read_file', 'write_file', 'append_file', 'delete_file', 'mkdir', 'file_stats', 'scaffold', 'http_get_json', 'SNIPE'];
+const ACTIONS = ['list_files', 'read_file', 'write_file', 'append_file', 'delete_file', 'mkdir', 'file_stats', 'scaffold', 'http_get_json', 'SNIPE', 'AGENT'];
 
 // --- regex pattern safety (list_files) --------------------------------------
 // Workers run IN-PROCESS with the orchestrator, so a regex that backtracks
@@ -75,6 +75,7 @@ class Worker {
     this.executor = null;      // set by the pool/orchestrator (skill executor)
     this._consumeOnly = false; // per-task: payload.consumeOnly skips execution
     this._currentPayload = null;
+    this._lastReply = '';      // agent chat reply (per-task, surfaced on done)
     // Per-agent usage accounting (surfaced in the telemetry dashboard):
     this.busyMs = 0;        // cumulative wall time inside step() — owned signal
     this._stepStartedAt = null;
@@ -224,6 +225,75 @@ class Worker {
     return this.executor.execute(this, { payload: this._currentPayload || {}, kind: this.kind, id: 'current' });
   }
 
+  /**
+   * AGENT: freeform conversational work — the user just says what they
+   * want, no skill or trigger words. The brain runs a ReAct loop: each
+   * round it reasons, calls a tool (list/read/write/…) or emits ops, sees
+   * the REAL observation, and continues until it answers done:true. Every
+   * tool call and op runs through the sandbox-jailed actions.
+   *
+   * Long turns are protected from the lease reaper: each round renews the
+   * task's lease and worker heartbeat, and the loop abandons itself if the
+   * lease is lost. Per-round progress lands in a JSON file the chat UI
+   * polls, so "the agent is working" is observable, not a black hole.
+   */
+  async act_AGENT() {
+    if (!this.executor) {
+      throw new Error('AGENT refused: no executor wired');
+    }
+    if (!this.executor.agent) {
+      throw new Error('AGENT refused: agent brain not configured (no AGENT model)');
+    }
+    const task = this._currentTask || { id: null, payload: this._currentPayload || {} };
+    const taskId = task.id;
+    const dataDir = process.env.DAISY_DATA_DIR || path.join(__dirname, '..', 'database');
+
+    // Lease renewal: push the expiry forward before each round (and again
+    // after the loop) so a multi-minute turn is never reaped mid-flight.
+    const renewLease = (staleAt, info = {}) => {
+      if (taskId == null) return; // direct invocation without a real task
+      const r = this.governor.db
+        .prepare("UPDATE task_queue SET lease_expires=? WHERE id=? AND status='leased'")
+        .run(staleAt, taskId);
+      if (r.changes === 0) {
+        // Row still exists but isn't leased → the reaper got it; continuing
+        // would work under a stale identity. A fully absent row means a
+        // synthetic/direct invocation (unit tests) — nothing to renew.
+        const row = this.governor.db.prepare('SELECT id FROM task_queue WHERE id=?').get(taskId);
+        if (row) throw new Error(`task ${taskId} lease no longer held`); // reaper got it
+      }
+      this.governor.heartbeat(this.id);
+    };
+
+    // Per-round progress file for the chat UI (best-effort, never fatal).
+    const progressFile = path.join(dataDir, `agent-progress-${taskId}.json`);
+    const writeProgress = (info) => {
+      try {
+        fs.writeFileSync(progressFile, JSON.stringify({ taskId, at: Date.now(), ...info }));
+      } catch { /* progress is best-effort */ }
+    };
+    const clearProgress = () => { try { fs.unlinkSync(progressFile); } catch { /* already gone */ } };
+
+    try {
+      const result = await this.executor.executeAgent(this, { payload: task.payload || {}, kind: this.kind, id: taskId }, {
+        renewLease,
+        onRound: writeProgress,
+      });
+      if (taskId != null) renewLease(Date.now() + 60_000, { round: 'done' });
+      clearProgress(); // success: the progress marker is no longer needed
+      this._lastReply = result.reply || ''; // surfaced by the pool on completion
+      return result;
+    } catch (e) {
+      // Leave the progress file in place on failure — the watcher's pending
+      // detection uses it to distinguish a live-but-slow turn from a stuck
+      // one, and the error field tells the UI what happened.
+      try {
+        fs.writeFileSync(progressFile, JSON.stringify({ taskId, at: Date.now(), error: String(e.message || e).slice(0, 300) }));
+      } catch { /* best-effort */ }
+      throw e;
+    }
+  }
+
   // --- state machine ----------------------------------------------------------
 
   /**
@@ -240,6 +310,7 @@ class Worker {
     this.state.lastError = null;
     this._consumeOnly = false;
     this._currentPayload = null;
+    this._lastReply = '';
     this.state.phase = 'claimed';
   }
 
@@ -265,6 +336,7 @@ class Worker {
     this.governor.heartbeat(this.id);
 
     const { action, params = {} } = task.payload || {};
+    this._currentTask = task; // live task record (AGENT lease renewal reads the id)
     this._consumeOnly = task.payload && task.payload.consumeOnly === true;
     this._currentPayload = task.payload || {};
     if (task.payload && task.payload.needsSkill && !this.state.injectedSkill) {
@@ -283,7 +355,7 @@ class Worker {
     try {
       const result = await fn.call(this, params);
       this.state.history.push({ action, ok: true });
-      const done = action === 'SNIPE'; // SNIPE consumes the gate and finishes
+      const done = action === 'SNIPE' || action === 'AGENT'; // one-shot conversational/work actions finish the task
       if (done) this.state.phase = 'done';
       return { workerId: this.id, taskId: task.id, ok: true, action, result, phase: this.state.phase, done };
     } catch (err) {
