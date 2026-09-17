@@ -276,17 +276,27 @@ class Orchestrator {
         }
       }, 5_000).unref();
     }
-    let lastTelemetry = 0;
+    // Telemetry heartbeat: a SEPARATE unref'd timer, deliberately not in
+    // the tick loop below. runCycle awaits task processing inline (tier-2
+    // consults, worker steps), so a hung consult would freeze any write
+    // that lives inside the loop — the stale-dashboard incident. This
+    // timer fires on the event loop independently, so dashboard freshness
+    // holds even while a cycle is stuck mid-consult (snapshot shows the
+    // last-known pool/queue state plus a live ts).
+    setInterval(() => {
+      try {
+        this.writeTelemetryFile();
+      } catch (err) {
+        // Never let a telemetry hiccup kill the heartbeat.
+        if (this.verbose) console.error(`[orch] telemetry heartbeat error: ${String(err.message)}`);
+      }
+    }, ORCH_POLICY.TELEMETRY_WRITE_MS).unref();
     // eslint-disable-next-line no-constant-condition
     while (true) {
       try {
         await this.runCycle();
       } catch (err) {
         console.error(`[orch] cycle error: ${String(err.message)}`);
-      }
-      if (Date.now() - lastTelemetry >= ORCH_POLICY.TELEMETRY_WRITE_MS) {
-        this.writeTelemetryFile();
-        lastTelemetry = Date.now();
       }
       await this.sleep(this.tickMs);
     }

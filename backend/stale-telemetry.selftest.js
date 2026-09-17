@@ -128,6 +128,45 @@ check('LaunchAgent plist exports DAISY_OLLAMA_TIMEOUT_MS', () => {
     assert.ok(Date.now() - snap.ts < 5_000, `snapshot ts ${Date.now() - snap.ts}ms old`);
   });
 
+  // --- Layer 4: real serve() loop — heartbeat outlives a stuck cycle -------
+  console.log('== serve() heartbeat outlives a stuck cycle ==');
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'daisy-stale2-'));
+  process.env.DAISY_DATA_DIR = tmp2;
+  delete require.cache[require.resolve('./index')];
+  const { Orchestrator: Orch2 } = require('./index');
+  let consults = 0;
+  // Consult hangs on FIRST call and never returns — the serve loop stays
+  // inside runCycle for the entire test window.
+  const hung2 = {
+    buildRequestPayload: (p) => p, // consulted via consultSupervisor before routeTask
+    routeTask: () => { consults += 1; return new Promise(() => {}); },
+    tier3ConsultCostUsd: () => 0,
+    modelChain: ['test/stub-model'],
+  };
+  const orch2 = new Orch2({
+    dbPath: path.join(tmp2, 'db.sqlite'),
+    bridge: hung2,
+    tickMs: 50,
+    verbose: false,
+  });
+  orch2.governor.enqueueTask('scaffold', { action: 'SNIPE', needsSkill: true, summary: 'stuck in consult forever' });
+  const servePromise = orch2.serve();
+  servePromise.catch(() => {}); // never resolves; silence unhandled rejection
+
+  // Give serve() time to lease the task and wedge inside the consult, then
+  // check the heartbeat kept the snapshot fresh the whole time.
+  await new Promise((r) => setTimeout(r, 4_000));
+  check('serve() actually wedged inside a consult (test precondition)', () => {
+    assert.strictEqual(consults, 1, 'expected exactly one hung consult');
+  });
+  check('telemetry stayed fresh for 4s while the cycle was stuck', () => {
+    const file = path.join(tmp2, 'telemetry.json');
+    assert.ok(fs.existsSync(file), 'no telemetry file written');
+    const snap = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const age = Date.now() - snap.ts;
+    assert.ok(age < 2_000, `snapshot ${age}ms old — heartbeat not independent`);
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
