@@ -24,8 +24,55 @@ const { Governor } = require('../governor/governor');
 // Lazily-constructed Governor sharing the orchestrator's task_queue DB.
 // Access is INSERT-only (enqueueTask), so WAL concurrency with the
 // orchestrator is safe.
-const TASK_KINDS = new Set(['file-io', 'scaffold', 'generic']);
+const TASK_KINDS = new Set(['file-io', 'scaffold', 'generic', 'agent']);
 const governor = new Governor({ silent: true });
+
+// --- Chat store (freeform agent conversation) -------------------------------
+// The conversation is one thread, persisted to database/chat.json. The user's
+// message is appended at enqueue time; the model's reply is appended by the
+// refresh loop below when telemetry.agentReply shows the turn landed.
+const CHAT_FILE = path.join(
+  process.env.DAISY_DATA_DIR || path.join(__dirname, '..', 'database'),
+  'chat.json',
+);
+const CHAT_MAX = 200; // bounded transcript
+
+function readChat() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CHAT_FILE, 'utf8'));
+    return Array.isArray(raw.messages) ? raw : { messages: [] };
+  } catch {
+    return { messages: [] };
+  }
+}
+
+function writeChat(chat) {
+  chat.messages = chat.messages.slice(-CHAT_MAX);
+  fs.writeFileSync(CHAT_FILE, JSON.stringify(chat, null, 2));
+}
+
+function appendChat(role, text, meta = {}) {
+  const chat = readChat();
+  chat.messages.push({ role, text: String(text).slice(0, 4000), at: Date.now(), ...meta });
+  writeChat(chat);
+  return chat;
+}
+
+// Reply watcher: poll telemetry.json for agentReply newness (the orchestrator
+// writes it on AGENT completion). Cheap — one small JSON read per 2s.
+let _lastReplyTaskId = null;
+try { _lastReplyTaskId = readChat().messages.filter((m) => m.role === 'agent').slice(-1)[0]?.taskId ?? null; } catch {}
+setInterval(() => {
+  try {
+    const t = JSON.parse(fs.readFileSync(TELEMETRY_FILE, 'utf8'));
+    const r = t.agentReply;
+    if (r && r.taskId && r.taskId !== _lastReplyTaskId) {
+      _lastReplyTaskId = r.taskId;
+      appendChat('agent', r.reply || '(no reply text)', { taskId: r.taskId, ops: r.ops || [] });
+      console.log(`[telemetry] agent reply for task ${r.taskId} appended to chat`);
+    }
+  } catch { /* telemetry not written yet */ }
+}, 2000).unref();
 
 function readJsonBody(req, cb) {
   let body = '';
@@ -103,9 +150,39 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // --- Freeform agent chat -------------------------------------------------
+  // POST /api/chat {message} → enqueues an AGENT task (no trigger words, no
+  // skill needed). GET /api/chat → the persisted transcript + pending flag.
+  if (req.method === 'POST' && req.url === '/api/chat') {
+    readJsonBody(req, (err, body) => {
+      if (err) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: 'invalid JSON body' }));
+        return;
+      }
+      const message = String((body && body.message) || '').trim().slice(0, 4000);
+      if (!message) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: 'message is required' }));
+        return;
+      }
+      const id = governor.enqueueTask('agent', { action: 'AGENT', summary: message });
+      appendChat('user', message, { taskId: id });
+      console.log(`[telemetry] agent turn enqueued as task ${id} via chat`);
+      res.end(JSON.stringify({ ok: true, id }));
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && req.url === '/api/chat') {
+    const chat = readChat();
+    res.end(JSON.stringify({ messages: chat.messages }));
+    return;
+  }
+
   if (req.method !== 'GET' || !req.url.startsWith('/api/telemetry')) {
     res.statusCode = 405;
-    res.end(JSON.stringify({ error: 'GET /api/telemetry or POST /api/enqueue only' }));
+    res.end(JSON.stringify({ error: 'GET /api/telemetry, GET/POST /api/chat, or POST /api/enqueue only' }));
     return;
   }
   res.end(JSON.stringify(readTelemetry()));

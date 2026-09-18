@@ -290,13 +290,52 @@ async function main() {
       const wLie = new Worker({ id: 'w-lie', kind: 'agent', governor: env.governor, root: env.sandbox });
       const lieReport = await exLie.executeAgent(wLie, { id: 9, kind: 'agent', payload: { summary: 'review the code' } });
       check('unbacked "created" claims are rewritten to no-change truth', /No changes were made/.test(lieReport.reply) && !/I have created/.test(lieReport.reply), lieReport.reply);
+      check('mid-sentence unbacked claims are stripped too (TODO.txt class)', !/has been created/i.test(lieReport.reply) && !/\bcreated\b/i.test(lieReport.reply), lieReport.reply);
 
       // Planner down → honest failure.
       const exDown = new SkillExecutor({ agent: { url: 'http://localhost:11434/api/chat', model: 'qwen2.5:1.5b', keepAlive: -1, timeoutMs: 20 } , fetchImpl: async () => { throw new Error('down'); } });
       const w4 = new Worker({ id: 'w-ag4', kind: 'agent', governor: env.governor, root: env.sandbox });
       let threw = false;
-      try { await exDown.executeAgent(w4, { id: 3, kind: 'agent', payload: { summary: 'x' } }); } catch (e) { threw = /planner unavailable/.test(e.message); }
-      check('agent planner down → task fails honestly', threw);
+      try { await exDown.executeAgent(w4, { id: 3, kind: 'agent', payload: { summary: 'x' } }); } catch (e) { threw = /planner unavailable/.test(e.message); }      check('agent planner down → task fails honestly', threw);
+
+      // Anti-laziness: a work request finished with zero work gets ONE
+      // forced continuation (the nudge observation names the omission);
+      // after the nudge the corrected turn completes with real ops.
+      {
+        let calls = 0;
+        const seenPrompts = [];
+        const exLazy = new SkillExecutor({
+          agent: { url: 'http://localhost:11434/api/chat', model: 'qwen2.5:1.5b', keepAlive: -1, timeoutMs: 1000, maxTokens: 1200 },
+          fetchImpl: async (url, init) => {
+            calls += 1;
+            const body = JSON.parse(init.body);
+            if (body.messages.some((m) => /no tool calls and written nothing/.test(m.content))) seenPrompts.push(true);
+            const content = calls === 1
+              ? { thought: 'done', done: true, reply: 'A summary of the sample-shop project.' }
+              : { thought: 'doing it', ops: [{ action: 'write_file', path: 'AGENT-NOTES.md', content: '# Notes\nreal summary\n' }], done: true, reply: 'Wrote AGENT-NOTES.md with the summary.' };
+            return { ok: true, json: async () => ({ message: { content: JSON.stringify(content) } }) };
+          },
+        });
+        const wLazy = new Worker({ id: 'w-lazy', kind: 'agent', governor: env.governor, root: env.sandbox });
+        const lazy = await exLazy.executeAgent(wLazy, { id: 11, kind: 'agent', payload: { summary: 'write a summary file for the project' } });
+        check('zero-work finish on a work request triggers the nudge', seenPrompts.length === 1);
+        check('nudged turn corrects course and writes the file', lazy.ops.length === 1 && lazy.ops[0].path === 'AGENT-NOTES.md', JSON.stringify(lazy.ops));
+      }
+
+      // Genuine Q&A is never nudged: zero-work finish accepted immediately.
+      {
+        let calls = 0;
+        const exQa = new SkillExecutor({
+          agent: { url: 'http://localhost:11434/api/chat', model: 'qwen2.5:1.5b', keepAlive: -1, timeoutMs: 1000, maxTokens: 1200 },
+          fetchImpl: async () => {
+            calls += 1;
+            return { ok: true, json: async () => ({ message: { content: JSON.stringify({ thought: 'answer', done: true, reply: 'It exports a single place() function.' }) } }) };
+          },
+        });
+        const wQa = new Worker({ id: 'w-qa', kind: 'agent', governor: env.governor, root: env.sandbox });
+        const qa = await exQa.executeAgent(wQa, { id: 12, kind: 'agent', payload: { summary: 'what does orders.js export?' } });
+        check('genuine Q&A finishes immediately with no nudge', calls === 1 && qa.reply.includes('place() function'));
+      }
     } finally { env.cleanup(); }
   }
 

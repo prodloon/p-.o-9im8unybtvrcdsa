@@ -53,7 +53,7 @@ const POLICY = {
   // call a tool (list/read/write/…), see the REAL observation, and reason
   // again — until it answers with done:true. Hard step budget + byte
   // budget; every tool call goes through the worker's sandbox-jailed actions.
-  AGENT_MAX_STEPS: Number(process.env.DAISY_AGENT_MAX_STEPS) || 8, // hard loop budget
+  AGENT_MAX_STEPS: Number(process.env.DAISY_AGENT_MAX_STEPS) || 12, // hard loop budget
   // Lease window for one agent round. MUST exceed the model round time
   // (AGENT_PLAN_TIMEOUT_MS) + tool time + margin: the lease is renewed at
   // the START of each round to cover the whole round — a 240s inference
@@ -224,6 +224,7 @@ const AGENT_SYSTEM_PROMPT = [
   'Ops actions allowed: write_file, append_file, mkdir. Paths relative (no .., no leading /). Never delete files. Full file contents, never diffs.',
   'You have a limited step budget — do not waste rounds; work independently and never ask the user questions mid-task.',
   'HARD RULE: never claim a file exists unless you wrote it in THIS conversation. A pure question gets done:true and the answer, immediately.',
+  'HARD RULE: finish honestly. The reply must state what you DID (tools called, files written) or the real answer — restating the request as if it were done ("a summary has been written") without doing the work is a failure and will be caught.',
 ].join(' ');
 
 const AGENT_TOOLS = ['list_files', 'read_file', 'file_stats', 'write_file', 'append_file', 'mkdir', 'http_get_json'];
@@ -321,6 +322,10 @@ async function runAgentLoop(worker, task, summary, existingFiles, opts = {}) {
   let bytesWritten = 0;
   let reply = '';
   let steps = 0;
+  let nudges = 0;
+  // Does the user's request ask for actual work? Pure Q&A ("explain X",
+  // "what is Y") never needs a nudge; work verbs do.
+  const requestDemandsWork = /\b(write|create|make|add|update|fix|organize|scaffold|summarize|summarise|review|refactor|clean|rename|move|generate|build)\b/i.test(String(summary || ''));
   let staleAt = Date.now() + leaseMs;
   reportRound({ round: 0, tool: null, ops: 0 });
 
@@ -362,7 +367,9 @@ async function runAgentLoop(worker, task, summary, existingFiles, opts = {}) {
         if (!fn) throw new Error(`round ${steps}: worker has no action '${op.action}'`);
         const params = op.action === 'mkdir' ? { path: op.path } : { path: op.path, content: op.content };
         try { fn.call(worker, params); } catch (e) { throw new Error(`round ${steps}: ${op.action} ${op.path} failed: ${e.message}`); }
-        ops.push({ action: op.action, path: op.path });
+        // Keep the FULL op (content included): executeAgent validates this
+        // list and must not re-execute it — the op already landed.
+        ops.push({ action: op.action, path: op.path, content: op.content });
       }
       reportRound({ round: steps, tool: null, ops: ops.length });
       // Single-round plan (Round-9 shape: ops + reply, no tool/done) or an
@@ -378,6 +385,18 @@ async function runAgentLoop(worker, task, summary, existingFiles, opts = {}) {
 
     // --- FINISH: pure answer / explicit done ------------------------------
     if ((typeof parsed.reply === 'string' && parsed.reply.trim() && !parsed.tool) || parsed.done === true) {
+      // Anti-laziness guard: finishing with ZERO work (no ops, no tool calls
+      // all turn) on a request that asks for work is exactly how small models
+      // "answer" without acting — e.g. replying "A summary of the project."
+      // to "write a summary file". Give ONE pointed continuation whose
+      // observation makes the omission explicit, then accept the reply even
+      // if it stays work-free (genuine Q&A must keep working).
+      if (ops.length === 0 && toolCalls.length === 0 && nudges < 1 && requestDemandsWork) {
+        nudges += 1;
+        messages.push({ role: 'assistant', content: JSON.stringify({ thought, done: true, reply: _clip(String(parsed.reply || ''), 120) }) });
+        messages.push({ role: 'user', content: JSON.stringify({ observation: 'you have made no tool calls and written nothing this turn — do the actual work with tools/ops now, or answer done:true with the complete real result if none is genuinely needed', ok: false }) });
+        continue;
+      }
       reply = String(parsed.reply || '').trim();
       break;
     }
@@ -399,6 +418,7 @@ async function runAgentLoop(worker, task, summary, existingFiles, opts = {}) {
     note: `agent plan (react: ${agent.model}, ${steps} round(s), ${toolCalls.length} tool call(s))`,
     rounds: steps,
     toolCalls,
+    alreadyExecuted: true, // the loop executes ops as it goes — never re-run
   };
 }
 
@@ -591,16 +611,26 @@ class SkillExecutor {
     // pure answer to a question is a complete turn. Only NON-empty plans
     // are validated/executed.
     const ops = plan.ops.length > 0 ? validateOps(plan.ops) : [];
-    // Anti-hallucination pass: a reply that CLAIMS file actions must be
-    // backed by real ops. Small local models routinely say "I created X"
-    // while emitting no op for X — rewrite the reply to say what actually
-    // happened, so the chat never shows a lie.
-    let reply = String(plan.reply || '').trim();
-    if (ops.length === 0 && /\b(created|wrote|writt?en|added|updated|modified|deleted)\b/i.test(reply)) {
-      reply = 'No changes were made. ' + reply.replace(/^\s*I\s+(have\s+)?/i, '');
+    // ReAct turns execute their ops INSIDE the loop (the model observes each
+    // round's real result) — re-running them here would clobber files with
+    // empty content. Builders return planSource='tier1-builder' and DO rely
+    // on this trailing execution, so only skip for executed ReAct turns.
+    let executed = [];
+    let filesWritten = [];
+    if (plan.alreadyExecuted) {
+      executed = ops.map((o) => ({ action: o.action, path: o.path, ok: true }));
+      filesWritten = ops.filter((o) => o.action !== 'mkdir').map((o) => o.path);
+    } else {
+      ({ executed, filesWritten } = executeOps(worker, ops));
     }
-    const { executed, filesWritten } = executeOps(worker, ops);
     worker.state.filesWritten.push(...filesWritten);
+    let reply = String(plan.reply || '').trim();
+    if (ops.length === 0 && /\b(created|wrote|writt?en|added|updated|modified|deleted|saved|made)\b/i.test(reply)) {
+      const sentences = reply.split(/(?<=[.!?])\s+/);
+      const honest = sentences.filter((s) => !/\b(created|wrote|writt?en|added|updated|modified|deleted|saved|made)\b/i.test(s));
+      reply = (honest.length ? honest.join(' ') : 'No changes were made.')
+        + ' No changes were made to the sandbox this turn.';
+    }
     return {
       appliedSkill: null,
       source: 'agent',

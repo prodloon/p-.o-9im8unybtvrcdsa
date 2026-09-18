@@ -36,6 +36,7 @@ const { SkillInjector } = require('./skill-injector');
 const { SkillExecutor } = require('./skill-executor');
 const { KeyHealthMonitor } = require('./key-health');
 const { T2Canary } = require('./t2-canary');
+const { generateDrill, seedFiles, gradeFromDisk, IdleWatch, DRILL_DIR } = require('./drill-runner');
 
 /** Round to 4 decimal places — money formatting for cost rollups. */
 const round4 = (x) => Math.round(x * 10000) / 10000;
@@ -119,11 +120,17 @@ class Orchestrator {
     this._tiers = { 'tier1-template': 0, 'tier2-local': 0, supervisor: 0, 'local-fallback': 0 };
     this._lastTier = null;
     this._lastAgentReply = null; // latest freeform agent turn (chat UI)
+    this._lastDrill = null;      // latest idle-drill outcome (failsafe telemetry)
     this._agentTurns = new Map(); // taskId → {startedAt, rounds, tool, ops, leaseStaleAt} — live ReAct turns
     // The governor's lease reaper must not requeue tasks whose AGENT turn is
     // running (the turn renews its own lease each round; the registry entry
     // is removed when the turn finishes either way).
     this.governor._isAgentTurnFn = (taskId) => this._agentTurns.has(taskId);
+    // Idle-drill failsafe: when the cluster idles too long, enqueue a
+    // self-directed, mechanically-graded puzzle (its own drill/ jail) so the
+    // agent's autonomy has a measured, contained outlet — and idleness can
+    // never silently mask a dead brain. See drill-runner.js header.
+    this.idleWatch = new IdleWatch(opts.idleWatchOpts || {});
   }
 
   _catalog() {
@@ -263,6 +270,10 @@ class Orchestrator {
       const ok = !!(report && report.ok);
       worker.state.phase = ok ? 'done' : 'failed'; // release back to the pool
       if (isAgentTurn) this._agentTurns.delete(task.id); // turn finished (either way)
+      // Drill failsafe: a finished drill task is graded mechanically from
+      // the jail's contents — success is measured, never self-reported.
+      const isDrill = (task.payload && task.payload.isDrill) === true;
+      if (isDrill && ok) this._gradeDrill(task, report.result || {});
       if (ok && report.result && report.result.reply) {
         // Freeform AGENT turn: keep the model's user-facing reply for the
         // chat UI (latest reply only — the conversation is one thread).
@@ -280,9 +291,16 @@ class Orchestrator {
         this.governor.completeTask(task.id, true);
         stats.tasksDone += 1;
       } else {
-        // Poison guard: fail permanently after MAX_TASK_ATTEMPTS
         const attempts = (task.attempts || 0) + 1;
-        if (attempts >= ORCH_POLICY.MAX_TASK_ATTEMPTS) {
+        if (isDrill) {
+          // A failed drill never re-runs the SAME puzzle: record the
+          // mechanical failure now; the failsafe retries ONCE with a fresh
+          // puzzle, then escalates to an alert. No poison-loop possible.
+          this._failDrill(task, report && report.error);
+          this.governor.completeTask(task.id, false);
+          stats.tasksFailed += 1;
+        } else if (attempts >= ORCH_POLICY.MAX_TASK_ATTEMPTS) {
+          // Poison guard: fail permanently after MAX_TASK_ATTEMPTS.
           this.governor.completeTask(task.id, false);
           stats.tasksFailed += 1;
           if (this.verbose) console.log(`[orch] task ${task.id} failed permanently after ${attempts} attempts`);
@@ -296,6 +314,23 @@ class Orchestrator {
     }
 
     this.pool.heartbeatAll(); // end-of-cycle pass: workers spawned mid-cycle get usage rows too
+
+    // Idle-drill failsafe: a fully idle cycle window (nothing done, nothing
+    // failed) eventually enqueues a drill for the cluster to solve. Runs
+    // AFTER the drain loop so real work always preempts drills.
+    try {
+      if (this.idleWatch.cycle(stats.tasksDone, stats.tasksFailed) === 'enqueue') {
+        // A drill turn can outlive the idle window (multi-round ReAct on a
+        // slow box) — never stack a second drill while one is in flight.
+        const inFlight = this.governor.db
+          .prepare("SELECT COUNT(*) n FROM task_queue WHERE kind='drill' AND status IN ('pending','leased')")
+          .get().n;
+        if (inFlight === 0) this._runDrill();
+        else if (this.verbose) console.log('[orch] idle drill due but one is already in flight — skipping');
+      }
+    } catch (err) {
+      if (this.verbose) console.error(`[orch] drill watchdog error: ${String(err.message)}`);
+    }
 
     stats.lastTier = this._lastTier; // which tier handled the last consult
     if (this.verbose) {
@@ -439,6 +474,110 @@ class Orchestrator {
     };
   }
 
+  /**
+   * Idle-drill failsafe: generate a fresh random puzzle, seed its input
+   * files, and enqueue it as a self-directed task. The drill runs in its
+   * own drill/ jail — it cannot touch project files — and is graded
+   * mechanically on completion: success is MEASURED, never self-reported.
+   * Enqueue-only here (no await): the drill rides the normal queue on the
+   * NEXT cycle, so a user task racing it simply preempts it.
+   */
+  _runDrill() {
+    const drill = generateDrill();
+    const seed = seedFiles(drill);
+    const drillRoot = path.join(this.pool.root, DRILL_DIR);
+    fs.mkdirSync(drillRoot, { recursive: true });
+    for (const f of seed) {
+      fs.writeFileSync(path.join(this.pool.root, f.path), f.content);
+    }
+    const taskId = this.governor.enqueueTask('drill', {
+      action: 'AGENT',
+      consumeOnly: false,
+      summary: drill.task,
+      drillId: drill.id,
+      isDrill: true,
+    });
+    this._lastDrill = {
+      id: drill.id,
+      taskId,
+      shape: drill.id.split('-')[1],
+      enqueuedAt: Date.now(),
+      outcome: null,
+    };
+    if (this.verbose) console.log(`[orch] idle drill enqueued: ${drill.id} (task ${taskId})`);
+  }
+
+  /**
+   * Mechanical grading of a finished drill — pure function of the drill
+   * jail's contents, re-derived from the seed files (written by THIS
+   * module, not the model). Nothing the agent produced is trusted:
+   * - the marker comes from the task's own recorded prompt,
+   * - the expected answer comes from the seed files,
+   * - any model write touching a seed file is tamper → automatic FAIL.
+   * Outcome lands in telemetry; a failed drill re-enqueues exactly ONE
+   * fresh drill (a different puzzle in a clean jail) before alerting.
+   */
+  _gradeDrill(task, result) {
+    const payload = task.payload || {};
+    const drillRoot = path.join(this.pool.root, DRILL_DIR);
+    // Seed tamper check: ops the model actually executed must not touch
+    // its own ground truth. With the drill jail, op paths are relative to
+    // sandbox/drill/ — a seed write is exactly 'config.txt' etc. (or a
+    // nested variant in a non-jail legacy path).
+    const touchedSeed = (result.ops || []).some((o) =>
+      /^(?:drill\/)?(?:config|ledger|codeword)\.txt$/.test(String(o.path || '')));
+    let written = {};
+    try {
+      for (const name of fs.readdirSync(drillRoot)) {
+        const p = path.join(drillRoot, name);
+        if (fs.statSync(p).isFile()) written[name] = fs.readFileSync(p, 'utf8');
+      }
+    } catch { /* no drill dir → grade fails below */ }
+    const read = (name) => { try { return fs.readFileSync(path.join(drillRoot, name), 'utf8'); } catch { return null; } };
+    let outcome = touchedSeed
+      ? { pass: false, detail: 'agent tampered with the drill seed files — automatic fail' }
+      : gradeFromDisk(written, {
+          seedCfg: read('config.txt'),
+          seedLedger: read('ledger.txt'),
+          seedCodeword: read('codeword.txt'),
+          taskSummary: payload.summary,
+        });
+    outcome = { ...outcome, at: Date.now(), drillId: payload.drillId || null, ops: result.ops || [], rounds: result.rounds || 1 };
+    // Jail cleanup BEFORE recording: a failed grade re-enqueues a fresh
+    // drill immediately, and its seed-writing must not be wiped by a stale
+    // rmSync (the grader is stateless and reads from disk).
+    try { fs.rmSync(drillRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    this._recordDrillOutcome(task.id, outcome);
+  }
+
+  /** Executor-level drill failure (loop threw): record + retry-once. */
+  _failDrill(task, errMsg) {
+    const outcome = { pass: false, detail: `agent turn failed: ${String(errMsg || 'unknown error').slice(0, 160)}`, at: Date.now(), drillId: (task.payload || {}).drillId || null, ops: [], rounds: 0 };
+    this._recordDrillOutcome(task.id, outcome);
+    const drillRoot = path.join(this.pool.root, DRILL_DIR);
+    try { fs.rmSync(drillRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+
+  /** Record outcome (telemetry + log + one-shot fresh-drill retry). */
+  _recordDrillOutcome(taskId, outcome) {
+    this._lastDrill = { taskId, ...outcome };
+    if (this.verbose) console.log(`[orch] drill ${outcome.drillId || taskId}: ${outcome.pass ? 'PASS' : 'FAIL'} — ${outcome.detail}`);
+    // Circuit breaker: one fresh-puzzle retry per failure, but after two
+    // consecutive failures stop drilling entirely — a permanently broken
+    // brain must produce an alert state, not an infinite drill chain.
+    if (!outcome.pass) {
+      this._drillConsecutiveFails = (this._drillConsecutiveFails || 0) + 1;
+      if (this._drillConsecutiveFails < 2) {
+        if (this.verbose) console.log('[orch] drill failed — enqueueing one fresh drill (different puzzle, clean jail)');
+        this._runDrill();
+      } else if (this.verbose) {
+        console.error('[orch] DRILL ALERT: 2 consecutive drill failures — failsafe paused, brain needs attention');
+      }
+    } else {
+      this._drillConsecutiveFails = 0;
+    }
+  }
+
   telemetry() {
     const r = this.governor.ramReader();
     return {
@@ -480,6 +619,9 @@ class Orchestrator {
       t2Health: this.t2Canary.snapshot(),
       // Freeform agent chat: the latest turn's user-facing reply.
       agentReply: this._lastAgentReply || null,
+      // Idle-drill failsafe (dashboard card): watchdog state + last outcome.
+      idle: this.idleWatch.snapshot(),
+      drill: this._lastDrill,
       agentTurns: [...this._agentTurns.values()].map((t) => ({
         ...t,
         runningSec: Math.round((Date.now() - t.startedAt) / 1000),

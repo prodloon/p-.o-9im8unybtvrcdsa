@@ -65,6 +65,23 @@ export async function enqueueTask(kind, payload) {
 /** Shell alert channel: the Rust host emits `shell://no-node` when no Node
  *  runtime was found at launch (backend can never spawn). Returns unlisten,
  *  or null in plain-browser mode where the concept doesn't apply. */
+export async function sendChat(message) {
+  const res = await fetch('http://127.0.0.1:6292/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `chat failed (${res.status})`);
+  return data;
+}
+
+export async function fetchChat() {
+  const res = await fetch('http://127.0.0.1:6292/api/chat');
+  if (!res.ok) throw new Error(`chat history failed (${res.status})`);
+  return res.json();
+}
+
 export async function subscribeShellAlert(onAlert) {
   if (!isTauri()) return null;
   const { listen } = await import('@tauri-apps/api/event');

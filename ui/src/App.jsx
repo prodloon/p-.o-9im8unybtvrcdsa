@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { subscribeTelemetry, subscribeShellAlert, subscribeUpdateAvailable, subscribeUpdateReady, enqueueTask, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
+import { subscribeTelemetry, subscribeShellAlert, subscribeUpdateAvailable, subscribeUpdateReady, enqueueTask, sendChat, fetchChat, createThrottledFeed, FETCH_FAILED } from './telemetry.js';
 
 const MAX_HISTORY = 60; // ~60s of samples at 1Hz
 
@@ -250,6 +250,91 @@ function TaskForm() {
         <div className={`mt-2 text-xs ${status.ok ? 'text-emerald-400' : 'text-rose-400'}`}>{status.text}</div>
       )}
     </form>
+  );
+}
+
+/** Freeform agent chat: say anything, the agent plans + works on the sandbox project. */
+function ChatPanel() {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const scrollerRef = useRef(null);
+
+  useEffect(() => {
+    let stop = false;
+    const pull = async () => {
+      try {
+        const data = await fetchChat();
+        if (!stop) setMessages(data.messages || []);
+      } catch { /* server briefly down — keep last view */ }
+    };
+    pull();
+    const timer = setInterval(pull, 2000);
+    return () => { stop = true; clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (el) el.scrollTop = el.scrollHeight; // follow the newest message
+  }, [messages.length]);
+
+  const send = async (e) => {
+    e.preventDefault();
+    const msg = text.trim();
+    if (!msg || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await sendChat(msg);
+      setText('');
+      const data = await fetchChat();
+      setMessages(data.messages || []);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const lastMsg = messages[messages.length - 1];
+  const pending = busy || (lastMsg && lastMsg.role === 'user'); // user msg not yet answered
+
+  return (
+    <div className="rounded-xl border border-slate-700/60 bg-slate-800/60 p-4 flex flex-col h-96">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="text-xs font-medium uppercase tracking-wider text-slate-400">Talk to the agent</div>
+        <div className="text-xs text-slate-500">works inside daisy_sandbox_cluster/</div>
+      </div>
+      <div ref={scrollerRef} className="flex-1 overflow-y-auto space-y-2 pr-1">
+        {messages.length === 0 && (
+          <div className="text-sm text-slate-500 py-6 text-center">
+            Say anything — “add a config file for staging”, “explain the orders code”, “build a tags feature for the api”.
+          </div>
+        )}
+        {messages.map((m, i) => (
+          <div key={i} className={`text-sm rounded-lg px-3 py-2 max-w-[85%] ${m.role === 'user' ? 'ml-auto bg-sky-600/80 text-white' : 'bg-slate-900/80 text-slate-200 border border-slate-700/60'}`}>
+            {m.text}
+            {m.role === 'agent' && Array.isArray(m.ops) && m.ops.length > 0 && (
+              <div className="mt-1 text-xs text-emerald-400/90">wrote: {m.ops.map((o) => o.path).join(', ')}</div>
+            )}
+          </div>
+        ))}
+        {pending && !busy && (
+          <div className="text-sm text-slate-500 animate-pulse px-3">agent is thinking… (local model, can take a couple of minutes)</div>
+        )}
+      </div>
+      <form onSubmit={send} className="mt-2 flex gap-2">
+        <input value={text} onChange={(e) => setText(e.target.value)}
+          placeholder="tell the agent what to do…"
+          className="flex-1 rounded bg-slate-900 px-3 py-2 text-sm text-slate-200 border border-slate-600/60 placeholder-slate-600" />
+        <button type="submit" disabled={busy || !text.trim()}
+          className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-40">
+          {busy ? 'sending…' : 'Send'}
+        </button>
+      </form>
+      {error && <div className="mt-1 text-xs text-rose-400">{error}</div>}
+    </div>
   );
 }
 
@@ -574,6 +659,10 @@ export default function App() {
             <AgentTable workers={pool.workers} hostStats={sample?.hostStats} perWorkerRss={sample?.hostStats?.perWorkerRss} />
           </div>
         </div>
+      </div>
+
+      <div className="mt-4">
+        <ChatPanel />
       </div>
     </div>
   );

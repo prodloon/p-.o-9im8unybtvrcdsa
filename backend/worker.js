@@ -248,6 +248,19 @@ class Worker {
     const taskId = task.id;
     const dataDir = process.env.DAISY_DATA_DIR || path.join(__dirname, '..', 'database');
 
+    // Drill jail: a scheduled drill turn runs with the worker's root
+    // RE-ROOTED into sandbox/drill/ — its ops physically cannot touch any
+    // project file for the duration (restored in finally). This is the
+    // hard containment behind the drill failsafe: no prompt discipline
+    // required, the jail is filesystem-level.
+    const isDrill = !!(task.payload && task.payload.isDrill);
+    const realRoot = this.root;
+    if (isDrill) {
+      const drillRoot = path.join(realRoot, 'drill');
+      fs.mkdirSync(drillRoot, { recursive: true }); // create BEFORE re-rooting
+      this.root = drillRoot;
+    }
+
     // Lease renewal: push the expiry forward before each round (and again
     // after the loop) so a multi-minute turn is never reaped mid-flight.
     const renewLease = (staleAt, info = {}) => {
@@ -291,6 +304,8 @@ class Worker {
         fs.writeFileSync(progressFile, JSON.stringify({ taskId, at: Date.now(), error: String(e.message || e).slice(0, 300) }));
       } catch { /* best-effort */ }
       throw e;
+    } finally {
+      if (isDrill) this.root = realRoot; // always restore the real sandbox root
     }
   }
 

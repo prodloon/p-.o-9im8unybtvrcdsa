@@ -111,7 +111,7 @@ def suite_skill_executor():
     print("== SUITE 2c: SKILL EXECUTOR (SNIPE plans + executes, not just consumes) ==")
     code, out, _err = run_node("backend/skill-executor.selftest.js")
     check("executor", "skill-executor suite exits 0", code == 0)
-    check("executor", "45/45 checks pass", "45 passed, 0 failed" in out)
+    check("executor", "49/49 checks pass", "49 passed, 0 failed" in out)
     check("executor", "freeform AGENT turns work with no trigger words",
           "freeform AGENT — chat without trigger words" in out)
     check("executor", "tier-1 scaffold lands real project files",
@@ -120,6 +120,23 @@ def suite_skill_executor():
           "delete_file not allowed" in out and ".. traversal rejected" in out)
     check("executor", "end-to-end orchestrator cycle produces artifacts",
           "end-to-end — orchestrator cycle lands real project files" in out)
+
+
+def suite_drill_failsafe():
+    print("== SUITE 2d: IDLE-DRILL FAILSAFE (anti-rogue watchdog, mechanical grading) ==")
+    code, out, _err = run_node("backend/drill-runner.selftest.js")
+    check("drill", "drill failsafe suite exits 0", code == 0)
+    check("drill", "50/50 checks pass", "50 passed, 0 failed" in out)
+    check("drill", "three puzzle shapes, unique every draw",
+          "every drill id is unique (different outcome every time)" in out)
+    check("drill", "mechanical grading: exact answer passes, wrong fails",
+          "exact correct answer PASSES" in out and "missing answer file FAILS" in out)
+    check("drill", "idle threshold triggers exactly once per window",
+          "idle past threshold → ENQUEUE" in out)
+    check("drill", "E2E: idle cluster drills itself and grades PASS",
+          "grade recorded a PASS" in out)
+    check("drill", "rogue op is jailed + circuit breaker pauses failsafe",
+          "rogue op is jailed" in out and "circuit breaker engaged" in out)
 
 
 def suite_stale_telemetry_guard():
@@ -480,6 +497,7 @@ def main():
     suite_backend_battery()
     suite_stale_telemetry_guard()
     suite_skill_executor()
+    suite_drill_failsafe()
     suite_live_pipeline()
     suite_telemetry()
     suite_shell_artifacts()
