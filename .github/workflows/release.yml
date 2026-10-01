@@ -195,7 +195,7 @@ jobs:
           cp "macos/Daisy Cluster.app.tar.gz.sig" "Daisy.Cluster.app.tar.gz.sig"
 
       - name: Attach everything to the GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           name: Daisy Cluster ${{ env.TAG }}
